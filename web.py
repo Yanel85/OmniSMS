@@ -46,6 +46,25 @@ def _parse_bands(raw) -> List[int]:
             pass
     return []
 
+
+def normalize_outgoing_phone(raw: str) -> str:
+    """外发号码补全: 未带 '+' 国际前缀时默认补 '+86'; 已带 '+' 视为显式国际号码原样使用。
+
+    - '10010'        -> '+8610010'
+    - '13800138000'  -> '+8613800138000'
+    - '8610010'      -> '+8610010'   (已含国家码, 仅补 '+')
+    - '+1 202 555'   -> '+1202555'   (显式国际号码, 仅去除分隔符)
+    """
+    s = re.sub(r"[\s\-\(\)\.]", "", str(raw).strip())
+    if s.startswith("+"):
+        return s
+    digits = re.sub(r"\D", "", s)
+    if not digits:
+        return s
+    if digits.startswith("86"):
+        return "+" + digits          # 已含国家码, 仅补 '+'
+    return "+86" + digits            # 默认中国区号
+
 # ==================== FastAPI 应用 ====================
 app = FastAPI(
     title="OmniSMS Web Manager",
@@ -99,13 +118,13 @@ MAX_LOG_CACHE = 1000
 # ==================== 数据模型 ====================
 class SendSMSRequest(BaseModel):
     device_id: str
-    phone: str = Field(..., pattern=r"^\+?\d{6,15}$")
+    phone: str = Field(..., pattern=r"^\+?[\d][\d\s\-\(\)\.]{2,19}$")
     text: str = Field(..., min_length=1, max_length=1000)  # 与固件 SMS_MAX_BYTES 对齐, 支持长短信
 
 
 class MakeCallRequest(BaseModel):
     device_id: str
-    phone: str = Field(..., pattern=r"^\+?\d{6,15}$")
+    phone: str = Field(..., pattern=r"^\+?[\d][\d\s\-\(\)\.]{2,19}$")
 
 
 class HangupCallRequest(BaseModel):
@@ -512,7 +531,8 @@ async def send_sms(request: SendSMSRequest):
     if not engine:
         raise HTTPException(status_code=500, detail="Engine not initialized")
     
-    task_id = engine.send_sms(request.device_id, request.phone, request.text)
+    phone = normalize_outgoing_phone(request.phone)
+    task_id = engine.send_sms(request.device_id, phone, request.text)
     return JSONResponse(content={
         "success": True,
         "message": "短信发送命令已下发",
@@ -598,7 +618,8 @@ async def make_call(request: MakeCallRequest):
     if not engine:
         raise HTTPException(status_code=500, detail="Engine not initialized")
     
-    success = engine.make_call(request.device_id, request.phone)
+    phone = normalize_outgoing_phone(request.phone)
+    success = engine.make_call(request.device_id, phone)
     if success:
         return JSONResponse(content={
             "success": True,
