@@ -1585,6 +1585,24 @@ function handleDeviceEvent(data) {
         renderDeviceList();
         updateDeviceStats();
         showToast(`设备 ${data.device_id} 已离线`, 'warning');
+    } else if (data.event === 'device_offline') {
+        // 心跳超时, 被看门狗标记为离线
+        const device = AppState.devices.get(data.device_id);
+        if (device) {
+            device.status = 'offline';
+            if (data.last_heartbeat) device.last_heartbeat = data.last_heartbeat;
+        }
+        renderDeviceList();
+        updateDeviceStats();
+        showToast(`设备 ${data.device_id} 心跳超时已离线`, 'warning');
+    } else if (data.event === 'device_online') {
+        // 设备重新上线
+        const device = AppState.devices.get(data.device_id);
+        if (device) {
+            device.status = 'online';
+        }
+        renderDeviceList();
+        updateDeviceStats();
     }
 }
 

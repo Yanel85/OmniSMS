@@ -38,6 +38,13 @@ class Config:
     RESCAN_KNOWN_GROUP_SEC: float = 60.0    # 已确定但注册失败的设备组, 降低频率重新探测的间隔(秒)
     AUTO_SCAN_STOP_AFTER_DEVICE_SEC: float = 60.0  # 自动扫描发现设备后额外运行的最大宽限秒数(<=0 表示不自动停止)
 
+    # 心跳掉线判定参数(与 LuatOS main.lua 的 30s keepalive 对齐):
+    # 连续丢失 5 次心跳(= 5 * 30s = 150s 无心跳)即标记设备离线。
+    HEARTBEAT_INTERVAL_SEC: float = 30.0       # 设备心跳(keepalive)间隔(秒)
+    OFFLINE_MISSED_HEARTBEATS: int = 5         # 连续丢失心跳次数阈值 -> 触发离线
+    OFFLINE_TIMEOUT_SEC: float = HEARTBEAT_INTERVAL_SEC * OFFLINE_MISSED_HEARTBEATS  # 150s
+    WATCHDOG_INTERVAL_SEC: float = 10.0         # 掉线看门狗巡检间隔(秒), 应小于心跳间隔以尽早发现
+
     # 判定端口运行 OmniSMS 协议的事件类型集合。
     # 任一事件出现即确认该口为固件数据口(非 Lua REPL / AT 口),
     # 命中后补发 identify 并延长等待, 争取拿到含 imei 的 boot。
@@ -202,6 +209,19 @@ def device_local_to_utc_iso(local_str: str) -> str:
         return utc_timestamp()
 
 
+def parse_iso_utc(s: str) -> Optional[datetime]:
+    """将 UTC ISO 8601 字符串解析为带时区的 datetime; 解析失败返回 None。"""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC_TZ)
+        return dt.astimezone(UTC_TZ)
+    except (ValueError, TypeError):
+        return None
+
+
 # ==================== 数据模型 ====================
 @dataclass
 class DeviceInfo:
@@ -216,6 +236,8 @@ class DeviceInfo:
     paired_ports: set = field(default_factory=set)  # 同一物理模组的全部串口
     status: str = "offline"  # online | offline | error
     last_seen: str = ""      # 最后活跃时间(UTC ISO 8601, 带 +00:00 时区后缀)
+    last_heartbeat: str = "" # 最后收到心跳(boot/keepalive)的 UTC 时间, 用于掉线判定
+    missed_heartbeats: int = 0  # 连续丢失心跳计数(收到心跳时归零)
     rssi: Optional[int] = None  # 最近一次心跳信号强度(dBm)
     rsrp: Optional[int] = None
     rsrq: Optional[int] = None
@@ -311,7 +333,11 @@ class OmniSMSEngine:
         self.scan_operation_lock = threading.Lock()
         self.auto_scan_resume_after_manual = False
         self.reader_threads: Dict[str, threading.Thread] = {}
-        
+
+        # 掉线看门狗线程: 周期性检测在线设备是否超过阈值未收到心跳(150s)
+        self.watchdog_thread: Optional[threading.Thread] = None
+        self.watchdog_stop = threading.Event()
+
         # 待发送任务队列（简化版，生产环境建议用 Queue）
         self.pending_tasks: Dict[str, SMSTask] = {}
         
@@ -338,6 +364,7 @@ class OmniSMSEngine:
 
         self.running = True
         self.start_auto_scan()
+        self.start_watchdog()
 
         logger.info("OmniSMS Engine started successfully (auto scan enabled)")
 
@@ -349,6 +376,7 @@ class OmniSMSEngine:
         # 停止任何进行中的手动扫描与后台自动扫描
         self.scan_stop_event.set()
         self.auto_scan_stop.set()
+        self.watchdog_stop.set()
 
         # 停止所有读取线程
         with self.state_lock:
@@ -374,7 +402,10 @@ class OmniSMSEngine:
 
         if self.auto_scan_thread:
             self.auto_scan_thread.join(timeout=3.0)
-        
+
+        if self.watchdog_thread:
+            self.watchdog_thread.join(timeout=3.0)
+
         logger.info("OmniSMS Engine stopped")
     
     # ==================== 手动扫描控制 ====================
@@ -865,6 +896,7 @@ class OmniSMSEngine:
             model=model,
             status="online",
             last_seen=now,
+            last_heartbeat=now,
             serial_obj=ser
         )
         
@@ -949,7 +981,81 @@ class OmniSMSEngine:
             
             if port in self.reader_threads:
                 del self.reader_threads[port]
-    
+
+    # ==================== 心跳掉线看门狗 ====================
+
+    def start_watchdog(self):
+        """启动掉线看门狗线程: 周期性检测在线设备是否超过阈值未收到心跳。"""
+        if self.watchdog_thread and self.watchdog_thread.is_alive():
+            return
+        self.watchdog_stop.clear()
+        self.watchdog_thread = threading.Thread(
+            target=self._watchdog_loop, name="HeartbeatWatchdog", daemon=True
+        )
+        self.watchdog_thread.start()
+        logger.info("Heartbeat watchdog started "
+                    f"(timeout={self.config.OFFLINE_TIMEOUT_SEC:.0f}s, "
+                    f"check every {self.config.WATCHDOG_INTERVAL_SEC:.0f}s)")
+
+    def _watchdog_loop(self):
+        """掉线看门狗主循环: 按 WATCHDOG_INTERVAL_SEC 周期巡检设备心跳。"""
+        logger.info("Heartbeat watchdog thread started")
+        while self.running and not self.watchdog_stop.is_set():
+            if self.watchdog_stop.wait(self.config.WATCHDOG_INTERVAL_SEC):
+                break
+            try:
+                self._check_device_heartbeats()
+            except Exception as e:
+                logger.error(f"Error in heartbeat watchdog: {e}")
+        logger.info("Heartbeat watchdog thread stopped")
+
+    def _check_device_heartbeats(self):
+        """巡检在线设备的最后心跳时间, 超过 OFFLINE_TIMEOUT_SEC 即标记离线。
+
+        判定基准: 设备最后收到心跳(boot/keepalive)的时间 last_heartbeat。
+        连续丢失 5 次心跳(= 150s 无心跳)即视为离线。
+        """
+        now = time.time()
+        timeout = self.config.OFFLINE_TIMEOUT_SEC
+        interval = self.config.HEARTBEAT_INTERVAL_SEC
+        with self.state_lock:
+            online_devices = [d for d in self.devices.values() if d.status == "online"]
+        for device in online_devices:
+            ref = device.last_heartbeat or device.last_seen
+            last_dt = parse_iso_utc(ref)
+            if last_dt is None:
+                continue
+            elapsed = now - last_dt.timestamp()
+            # 估算连续丢失心跳次数(供日志/前端展示)
+            device.missed_heartbeats = int(elapsed // interval) if interval > 0 else 0
+            if elapsed >= timeout:
+                dev_id = device_id_of(device)
+                logger.warning(
+                    f"Device {dev_id} lost {device.missed_heartbeats} consecutive heartbeats "
+                    f"({elapsed:.0f}s since last heartbeat); marking offline"
+                )
+                self._mark_device_offline(device, reason="heartbeat_timeout")
+
+    def _mark_device_offline(self, device: DeviceInfo, reason: str = ""):
+        """将设备标记为离线(内存 + 持久化 + 事件推送), 并归零连续心跳丢失计数。"""
+        dev_id = device_id_of(device)
+        with self.state_lock:
+            if device.status == "offline":
+                return
+            device.status = "offline"
+            device.missed_heartbeats = 0
+        if self.db:
+            self.db.update_device_status(
+                dev_id, "offline",
+                last_seen=device.last_heartbeat or device.last_seen,
+            )
+        self._notify_event("device_offline", dev_id, {
+            "status": "offline",
+            "reason": reason,
+            "last_heartbeat": device.last_heartbeat,
+        })
+        logger.info(f"✗ Device marked offline (heartbeat timeout): ID={dev_id}")
+
     def remove_device(self, device_id: str):
         """从引擎内存中彻底移除设备（关闭串口、清理端口映射与读取线程）。"""
         with self.state_lock:
@@ -1060,6 +1166,9 @@ class OmniSMSEngine:
             # 启动/心跳统一更新网络诊断字段
             was_offline = device.status != "online"
             device.status = "online"
+            # 收到心跳: 刷新最后心跳时间并归零连续丢失计数
+            device.last_heartbeat = device.last_seen
+            device.missed_heartbeats = 0
             for field_name in ("rssi", "rsrp", "rsrq", "snr", "net_status"):
                 value = msg.get(field_name)
                 if isinstance(value, (int, float)):
