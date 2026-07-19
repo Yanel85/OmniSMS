@@ -52,6 +52,8 @@ OmniSMS/
 ├── omnisms.py          # 核心守护引擎 OmniSMSEngine（端口发现、消息路由、下行命令）
 ├── database.py         # SQLite 持久化层（线程安全）
 ├── requirements.txt    # Python 依赖
+├── omnisms.sh          # 管理脚本：虚拟环境/守护进程/源码更新
+├── omnisms.service     # systemd 服务模板（开机自启）
 ├── omnisms.db          # SQLite 数据库文件（运行时生成）
 ├── logs/               # 按天轮转的日志文件
 ├── static/
@@ -161,6 +163,36 @@ python3 -m venv .venv
 |------|--------|------|
 | `--host` | `0.0.0.0` | Web 监听地址 |
 | `--port` | `8000` | Web 监听端口 |
+
+### 使用管理脚本（`omnisms.sh`）
+
+项目根目录提供 `omnisms.sh`，封装虚拟环境创建、依赖安装、守护进程启停与源码更新，无需手动操作 `.venv`。
+
+```bash
+chmod +x omnisms.sh
+
+./omnisms.sh start             # 启动 (自动创建 .venv 并安装依赖, 守护进程方式)
+./omnisms.sh stop              # 停止
+./omnisms.sh restart           # 重启
+./omnisms.sh status            # 查看运行状态
+./omnisms.sh logs              # 实时查看日志 (tail -f omnisms.log)
+./omnisms.sh update            # 从 GitHub 拉取最新源码覆盖本地并更新依赖, 然后停止 (需手动 start)
+```
+
+> 首次 `start` 若检测到 `.venv` 不存在，会自动执行 `python3 -m venv .venv` 并 `pip install -r requirements.txt`；若系统缺少 `python3-venv`，脚本会提示安装方式。
+
+### systemd 开机自启
+
+`omnisms.service` 为 systemd 服务模板（含 `__PROJECT_DIR__` / `__USER__` 占位符）。使用以下命令生成并安装（需 root）：
+
+```bash
+sudo ./omnisms.sh install-service   # 替换占位符写入 /etc/systemd/system/omnisms.service 并设为开机自启
+sudo systemctl start omnisms        # 启动服务
+sudo systemctl status omnisms       # 查看状态
+sudo ./omnisms.sh uninstall-service # 卸载服务 (需 root)
+```
+
+服务以 `Type=simple` 运行，失败自动重启（`Restart=on-failure`）；日志写入 `omnisms.log`。
 
 ---
 
