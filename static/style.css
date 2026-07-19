@@ -1,0 +1,738 @@
+/**
+ * OmniSMS v2.0 - Tailwind CSS 自定义补充样式
+ * 仅包含 Tailwind 无法实现的动画、状态等
+ */
+
+/* ==================== 导航标签激活态 ==================== */
+.nav-tab {
+    color: rgba(255,255,255,0.7);
+    background: transparent;
+}
+.nav-tab:hover {
+    background: rgba(255,255,255,0.1);
+    color: white;
+}
+.nav-tab.active {
+    background: rgba(59,130,246,0.25);
+    color: #60a5fa;
+}
+
+/* ==================== 状态指示点动画 ==================== */
+.status-dot.online { background: #10b981; }
+.status-dot.offline { background: #ef4444; animation: none; }
+
+/* ==================== 模块显示/隐藏 ==================== */
+.module {
+    display: none;
+    animation: fadeIn 0.3s ease;
+}
+.module.active {
+    display: block;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes modalIn {
+    from { opacity: 0; transform: scale(0.95) translateY(10px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.animate-modal-in {
+    animation: modalIn 0.3s ease-out;
+}
+
+/* ==================== 弹窗显隐 ==================== */
+.modal-overlay.show {
+    display: flex !important;
+    animation: fadeIn 0.2s ease;
+}
+
+/* ==================== 表格行悬停 ==================== */
+.data-table tbody tr {
+    transition: background-color 0.15s;
+}
+.data-table tbody tr:hover {
+    background-color: #f8fafc;
+}
+
+/* 设备状态徽章 */
+.device-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 3px 10px;
+    border-radius: 9999px;
+}
+.device-status .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+}
+.device-status.online .dot { background: #10b981; }
+.device-status.offline .dot { background: #94a3b8; }
+
+.device-status.online {
+    background: rgba(16,185,129,0.1);
+    color: #047857;
+}
+.device-status.offline {
+    background: #f1f5f9;
+    color: #94a3b8;
+}
+
+/* 设备备注 */
+.device-remark { color: #2563eb; font-weight: 500; }
+
+/* ==================== 信号强度指示器组件 ==================== */
+/* 用法: <span class="signal-indicator"> (内含若干 .signal-bar) */
+.signal-indicator {
+    display: inline-flex;
+    align-items: flex-end;
+    gap: 2px;
+    height: 14px;
+    line-height: 1;
+}
+.signal-bar {
+    position: relative;
+    width: 3px;
+    border-radius: 1px;
+    background: #e2e8f0;            /* 空格(无信号)颜色 */
+    overflow: hidden;
+}
+.signal-bar > i {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    border-radius: 1px;
+    background: currentColor;        /* 跟随父级颜色(满格/半格) */
+}
+/* 整组指示器: 图标 + 数值, 颜色由 JS 设置的 style="color:..." 控制 */
+.signal-indicator-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;  /* 数值等宽, 对齐稳定 */
+    white-space: nowrap;
+}
+/* 无信号/离线 文本弱化 */
+.signal-indicator-wrap.is-muted {
+    color: #94a3b8 !important;
+    font-weight: 500;
+}
+.no-remark { color: #94a3b8; font-style: italic; }
+
+/* 信号单元格: 运营商徽章 + 信号图标 同行, 徽章在图标前方 */
+.signal-cell {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+}
+.signal-hover-target {
+    cursor: help;
+    outline: none;
+}
+.signal-hover-target:focus-visible {
+    box-shadow: 0 0 0 2px #3b82f6;
+    border-radius: 4px;
+}
+
+/* 运营商徽章 (基于 IMSI 识别) */
+.carrier-badge {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 9999px;
+    white-space: nowrap;
+    line-height: 1.4;
+    color: #fff;
+}
+.carrier-mobile   { background: #06b6d4; }  /* 中国移动 */
+.carrier-unicom   { background: #f43f5e; }  /* 中国联通 */
+.carrier-telecom  { background: #6366f1; }  /* 中国电信 */
+.carrier-broadcast{ background: #f59e0b; }  /* 中国广电 */
+.carrier-unknown  { background: #94a3b8; }  /* 未知运营商 */
+
+/* ==================== 设备详情悬浮 Tooltip ==================== */
+.device-tooltip {
+    position: fixed;
+    z-index: 1000;
+    background: #1e293b;
+    color: #e2e8f0;
+    border-radius: 10px;
+    padding: 12px 14px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+    font-size: 12px;
+    pointer-events: none;          /* 不抢占悬停, 纯展示 */
+    min-width: 230px;
+    max-width: 320px;
+    animation: fadeIn 0.12s ease;
+}
+.device-tooltip .dt-title {
+    font-size: 12px;
+    font-weight: 700;
+    color: #fff;
+    margin-bottom: 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+}
+.device-tooltip .dt-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 16px;
+    padding: 3px 0;
+}
+.device-tooltip .dt-label {
+    color: #94a3b8;
+    flex-shrink: 0;
+}
+.device-tooltip .dt-value {
+    color: #e2e8f0;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    word-break: break-all;
+    text-align: right;
+}
+
+/* 操作按钮 */
+.btn-icon-sm {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 2px 4px;
+    opacity: 0.5;
+    transition: opacity 0.2s;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+.btn-icon-sm:hover { opacity: 1; }
+
+.btn-action {
+    background: none;
+    border: 1px solid #e2e8f0;
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+}
+.btn-action:hover { transform: scale(1.1); }
+.btn-action.btn-goto-sms:hover { background: rgba(16,185,129,0.1); border-color: #10b981; }
+.btn-action.btn-goto-call:hover { background: rgba(139,92,246,0.1); border-color: #8b5cf6; }
+.btn-action.btn-danger:hover { background: rgba(239,68,68,0.1); border-color: #ef4444; }
+
+/* NO. 单元格：号码与删除按钮同行对齐 */
+.no-cell {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.no-phone {
+    font-variant-numeric: tabular-nums;
+}
+/* 设备型号单元格 */
+.model-cell {
+    vertical-align: middle;
+}
+.model-value {
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 600;
+    color: #2563eb;
+    background: #eff6ff;
+    border: 1px solid #dbeafe;
+    padding: 1px 8px;
+    border-radius: 9999px;
+    white-space: nowrap;
+}
+
+/* 操作列：按钮水平居中排列 */
+.action-cell {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+}
+
+/* ==================== 聊天式布局补充 ==================== */
+
+/* 会话项 */
+.conversation-item {
+    padding: 14px 16px;
+    cursor: pointer;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    transition: all 0.15s;
+}
+.conversation-item:hover { background: rgba(255,255,255,0.05); }
+.conversation-item.active {
+    background: rgba(59,130,246,0.2);
+    border-left: 3px solid #3b82f6;
+}
+
+.conv-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.conv-phone { color: white; font-weight: 500; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv-time { color: rgba(255,255,255,0.3); font-size: 11px; flex-shrink: 0; }
+.conv-preview { color: rgba(255,255,255,0.5); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 4px; }
+
+/* 短信会话项：方向标记 + 预览 + 条数摘要 */
+.conv-preview-row { display: flex; align-items: center; gap: 6px; margin-top: 4px; min-width: 0; }
+.conv-dir { flex-shrink: 0; font-size: 11px; font-weight: 700; }
+.conv-dir.in { color: #38bdf8; }
+.conv-dir.out { color: #34d399; }
+.conv-preview { flex: 1; min-width: 0; }
+.conv-count {
+    flex-shrink: 0;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: 9px;
+    background: rgba(59,130,246,0.35);
+    color: #fff;
+    font-size: 11px;
+    line-height: 18px;
+    text-align: center;
+    font-weight: 600;
+}
+
+/* 筛选标签激活 */
+.filter-tab.active { background: #8b5cf6; color: white; }
+
+/* 通话记录项边框色 */
+.call-record-item.incoming { border-left: 3px solid #3b82f6; }
+.call-record-item.outgoing { border-left: 3px solid #8b5cf6; }
+.call-record-item.missed { border-left: 3px solid #ef4444; }
+
+.call-record-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 16px;
+    cursor: pointer;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    transition: all 0.15s;
+}
+.call-record-item:hover { background: rgba(255,255,255,0.05); }
+
+.call-type-icon { font-size: 18px; }
+.call-info { flex: 1; min-width: 0; }
+.call-phone { color: white; font-weight: 500; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.call-meta { color: rgba(255,255,255,0.4); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.call-time { color: rgba(255,255,255,0.3); font-size: 12px; flex-shrink: 0; }
+
+/* 聚合通话项：右侧显示条数 + 时间 */
+.call-right { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex-shrink: 0; }
+.call-count {
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: 9px;
+    background: rgba(139,92,246,0.35);
+    color: #fff;
+    font-size: 11px;
+    line-height: 18px;
+    text-align: center;
+    font-weight: 600;
+}
+
+/* 通话详情卡片 */
+.call-detail-card {
+    max-width: 400px;
+    margin: 40px auto;
+    background: white;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+    animation: fadeIn 0.3s ease;
+}
+.detail-header { padding: 20px; color: white; display: flex; justify-content: space-between; align-items: center; }
+.detail-header.incoming { background: #3b82f6; }
+.detail-header.outgoing { background: #8b5cf6; }
+.detail-header.missed { background: #ef4444; }
+.detail-type { font-size: 13px; opacity: 0.9; }
+.detail-phone { font-size: 17px; font-weight: 600; }
+.detail-body { padding: 20px; }
+.detail-row { display: flex; padding: 10px 0; border-bottom: 1px solid #e2e8f0; }
+.detail-row:last-child { border-bottom: none; }
+.detail-row label { width: 60px; color: #64748b; font-size: 13px; }
+.detail-row span { color: #1e293b; font-size: 13px; }
+.detail-actions { padding: 16px 20px; background: #f8fafc; display: flex; gap: 10px; }
+
+/* ==================== 聊天气泡 ==================== */
+.message-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    margin-bottom: 16px;
+    animation: bubbleIn 0.2s ease-out;
+}
+.message-row.received { flex-direction: row; }
+.message-row.sent { flex-direction: row-reverse; }
+
+@keyframes bubbleIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+/* 头像 */
+.msg-avatar {
+    flex-shrink: 0;
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 600;
+    color: #fff;
+    background: linear-gradient(135deg, #64748b, #475569);
+    user-select: none;
+}
+.msg-avatar.me {
+    background: linear-gradient(135deg, #10b981, #059669);
+}
+
+/* 消息列（发送者 + 气泡） */
+.msg-col {
+    display: flex;
+    flex-direction: column;
+    max-width: min(72%, 560px);
+    min-width: 0;
+}
+.message-row.sent .msg-col { align-items: flex-end; }
+.message-row.received .msg-col { align-items: flex-start; }
+
+.msg-sender {
+    font-size: 12px;
+    color: #94a3b8;
+    margin: 0 4px 4px;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.chat-bubble {
+    max-width: 100%;
+    min-width: 0;
+}
+
+.bubble-content {
+    padding: 10px 14px;
+    border-radius: 18px;
+    word-wrap: break-word;
+    overflow-wrap: anywhere;
+    line-height: 1.55;
+    font-size: 14px;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+}
+.chat-bubble.sent .bubble-content {
+    background: linear-gradient(135deg, #3b82f6, #2563eb);
+    color: #fff;
+    border-bottom-right-radius: 5px;
+}
+.chat-bubble.received .bubble-content {
+    background: #fff;
+    color: #1e293b;
+    border-bottom-left-radius: 5px;
+    border: 1px solid #e2e8f0;
+}
+
+.bubble-time {
+    font-size: 11px;
+    color: #94a3b8;
+    margin-top: 4px;
+    padding: 0 6px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+.message-row.sent .bubble-time { justify-content: flex-end; }
+.message-row.received .bubble-time { justify-content: flex-start; }
+.bubble-status { color: #38bdf8; font-weight: 600; }
+.chat-bubble.sent .bubble-status { color: #7dd3fc; }
+
+/* 日期分隔线 */
+.date-separator {
+    text-align: center;
+    margin: 18px 0;
+    position: relative;
+}
+.date-separator::before,
+.date-separator::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    width: 42%;
+    height: 1px;
+    background: #e2e8f0;
+}
+.date-separator::before { left: 0; }
+.date-separator::after { right: 0; }
+.date-separator > span {
+    background: #f8fafc;
+    display: inline-block;
+    padding: 2px 12px;
+    font-size: 12px;
+    color: #94a3b8;
+    position: relative;
+    border-radius: 10px;
+}
+
+/* 移动端：气泡更宽，头像略小 */
+@media (max-width: 640px) {
+    .msg-avatar { width: 32px; height: 32px; font-size: 11px; }
+    .msg-col { max-width: 82%; }
+    .bubble-content { font-size: 14px; padding: 9px 12px; }
+    .message-row { gap: 8px; margin-bottom: 12px; }
+}
+
+/* ==================== 日志模块 ==================== */
+
+.log-entry {
+    padding: 5px 12px;
+    border-radius: 4px;
+    margin-bottom: 2px;
+    transition: background 0.15s;
+    display: flex;
+    gap: 12px;
+}
+.log-entry:hover { background: rgba(255,255,255,0.05); }
+
+.log-timestamp { color: #64748b; white-space: nowrap; }
+.log-level { font-weight: 600; min-width: 75px; }
+.level-debug { color: #64748b; }
+.level-info { color: #3b82f6; }
+.level-warning { color: #f59e0b; }
+.level-error { color: #ef4444; }
+.level-critical { color: #ec4899; font-weight: 700; }
+.log-module { color: #8b5cf6; white-space: nowrap; }
+.log-message { color: #e2e8f0; word-break: break-word; }
+
+/* ==================== Toast 通知 ==================== */
+.toast {
+    background: #1e293b;
+    color: white;
+    padding: 14px 20px;
+    border-radius: 8px;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.3);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 14px;
+    transform: translateX(120%);
+    opacity: 0;
+    transition: all 0.3s cubic-bezier(0.68, -0.55, 0.265, 1.55);
+    min-width: 280px;
+}
+.toast.show {
+    transform: translateX(0);
+    opacity: 1;
+}
+.toast-success { border-left: 4px solid #10b981; }
+.toast-error { border-left: 4px solid #ef4444; }
+.toast-warning { border-left: 4px solid #f59e0b; }
+.toast-info { border-left: 4px solid #3b82f6; }
+
+/* Toast 图标用 SVG 替代 emoji */
+.toast-icon svg { width: 18px; height: 18px; }
+.toast-icon.success-icon { color: #10b981; }
+.toast-icon.error-icon { color: #ef4444; }
+.toast-icon.warning-icon { color: #f59e0b; }
+.toast-icon.info-icon { color: #3b82f6; }
+
+/* ==================== 响应式适配 ==================== */
+@media (max-width: 1024px) {
+    .chat-layout { grid-template-columns: [sidebar] 240px [main] 1fr; }
+}
+
+@media (max-width: 768px) {
+    .nav-tab { display: none; }
+    
+    .chat-layout {
+        grid-template-columns: 1fr;
+        min-height: 500px;
+    }
+    .conversation-sidebar { display: none; }
+    
+    .stat-card-online, .stat-card-offline, .stat-card-total {
+        padding: 12px;
+    }
+    .stat-number { font-size: 24px; }
+    
+    .data-table th, .data-table td {
+        padding: 10px 8px;
+        font-size: 12px;
+    }
+}
+
+/* ==================== 空状态 (empty-state) ==================== */
+.empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 48px 16px;
+    text-align: center;
+}
+.empty-state svg {
+    color: #cbd5e1;
+    margin-bottom: 16px;
+}
+.empty-state p {
+    margin: 0;
+    color: #475569;
+    font-size: 15px;
+    line-height: 1.6;
+}
+.empty-state .empty-hint,
+.empty-hint {
+    margin-top: 4px;
+    color: #94a3b8;
+    font-size: 13px;
+}
+
+/* 设备表格空行 */
+.empty-row td {
+    text-align: center;
+    padding: 48px 16px;
+}
+
+/* 会话 / 通话列表空状态 */
+.empty-conversation {
+    color: rgba(255,255,255,0.5);
+    font-size: 13px;
+    text-align: center;
+}
+
+/* 日志空状态 */
+.log-empty {
+    color: rgba(255,255,255,0.3);
+    text-align: center;
+    padding: 48px 16px;
+    font-size: 14px;
+}
+
+/* ==================== code 标签 ==================== */
+code {
+    background: #f1f5f9;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: 'SF Mono', 'Fira Code', Consolas, monospace;
+    font-size: 13px;
+}
+
+/* ==================== 内部独立滚动条 ==================== */
+/* 左侧会话/通话列表、聊天消息区、通话详情区、拨号盘：细滚动条，避免全局滚动 */
+.conversation-list,
+.chat-messages,
+.call-messages-area,
+.call-control-area {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(148,163,184,0.5) transparent;
+}
+
+.conversation-list::-webkit-scrollbar,
+.chat-messages::-webkit-scrollbar,
+.call-messages-area::-webkit-scrollbar,
+.call-control-area::-webkit-scrollbar {
+    width: 8px;
+}
+
+.conversation-list::-webkit-scrollbar-track,
+.chat-messages::-webkit-scrollbar-track,
+.call-messages-area::-webkit-scrollbar-track,
+.call-control-area::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.conversation-list::-webkit-scrollbar-thumb {
+    background: rgba(255,255,255,0.25);
+    border-radius: 4px;
+}
+.conversation-list::-webkit-scrollbar-thumb:hover {
+    background: rgba(255,255,255,0.4);
+}
+
+.chat-messages::-webkit-scrollbar-thumb,
+.call-messages-area::-webkit-scrollbar-thumb,
+.call-control-area::-webkit-scrollbar-thumb {
+    background: rgba(148,163,184,0.45);
+    border-radius: 4px;
+}
+.chat-messages::-webkit-scrollbar-thumb:hover,
+.call-messages-area::-webkit-scrollbar-thumb:hover,
+.call-control-area::-webkit-scrollbar-thumb:hover {
+    background: rgba(148,163,184,0.65);
+}
+
+/* 通话记录项选中高亮（按号码） */
+.call-record-item.active {
+    background: rgba(139,92,246,0.25);
+}
+
+/* ==================== 拨号盘键盘 ==================== */
+/* 按键：可点击区域为方形，内部圆环直径缩小，数字字号增大 */
+.dial-key {
+    background: transparent;
+    border: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 0.15s ease;
+}
+.dial-key::before {
+    content: '';
+    position: absolute;
+    width: 70%;
+    height: 70%;
+    border: 2px solid #e2e8f0;
+    border-radius: 50%;
+    background: #ffffff;
+    z-index: 0;
+    transition: background-color 0.2s ease, border-color 0.2s ease, transform 0.15s ease;
+}
+.dial-key .key-num {
+    position: relative;
+    z-index: 1;
+    font-size: 2rem;            /* 增大数字字号 */
+    font-weight: 500;
+    line-height: 1;
+    color: #1e293b;
+    transition: color 0.2s ease;
+}
+.dial-key .key-sub {
+    position: absolute;
+    bottom: 24%;
+    z-index: 1;
+    font-size: 9px;
+    font-weight: 400;
+    letter-spacing: 0.5px;
+    color: #94a3b8;
+    transition: color 0.2s ease;
+}
+.dial-key:hover::before {
+    background: #8b5cf6;
+    border-color: #8b5cf6;
+    transform: scale(1.05);
+}
+.dial-key:hover .key-num,
+.dial-key:hover .key-sub {
+    color: #ffffff;
+}
+.dial-key:active {
+    transform: scale(0.95);
+}

@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OmniSMS - Device & Communication Manager</title>
+    
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        brand: { 50: '#eff6ff', 100: '#dbeafe', 200: '#bfdbfe',
+                                500: '#3b82f6', 600: '#2563eb', 700: '#1d4ed8' },
+                        slate: { 850: '#172033', 900: '#0f172a' },
+                    }
+                }
+            }
+        }
+    </script>
+    
+    <!-- 自定义样式 (仅保留无法用Tailwind实现的) -->
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="bg-slate-50 text-slate-800 antialiased overflow-x-hidden">
+
+    <!-- ========== 导航栏 (固定顶部) ========== -->
+    <nav class="fixed top-0 inset-x-0 z-50 h-14 bg-gradient-to-r from-slate-900 to-slate-800 border-b border-white/10 backdrop-blur-md">
+        <div class="max-w-[1400px] mx-auto h-full flex items-center justify-between px-6">
+            <!-- Logo -->
+            <div class="flex items-center gap-3">
+                <!-- SVG 图标替代 emoji -->
+                <svg class="w-7 h-7 text-brand-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.141 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0"/>
+                </svg>
+                <span class="text-xl font-bold text-white tracking-tight">OmniSMS</span>
+                <span class="text-xs font-semibold px-2 py-0.5 rounded-full bg-brand-500/20 text-blue-300">v2.0</span>
+            </div>
+
+            <!-- 导航标签 -->
+            <div class="flex gap-1">
+                <button class="nav-tab active px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200" data-module="devices">
+                    <span class="inline-flex items-center gap-2">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>
+                        设备管理
+                    </span>
+                </button>
+                <button class="nav-tab px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200" data-module="sms">
+                    <span class="inline-flex items-center gap-2">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/></svg>
+                        短信收发
+                    </span>
+                </button>
+                <button class="nav-tab px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200" data-module="call">
+                    <span class="inline-flex items-center gap-2">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"/></svg>
+                        通话中心
+                    </span>
+                </button>
+                <button class="nav-tab px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200" data-module="logs">
+                    <span class="inline-flex items-center gap-2">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+                        系统日志
+                    </span>
+                </button>
+            </div>
+
+            <!-- 右侧操作 -->
+            <div class="flex items-center gap-4">
+                <div id="connectionStatus" class="flex items-center gap-2 text-sm text-slate-400">
+                    <span class="status-dot offline w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
+                    <span class="status-text">离线</span>
+                </div>
+                <button onclick="refreshAll()" class="p-2 rounded-lg bg-white/10 hover:bg-white/20 transition-colors" title="刷新">
+                    <svg class="w-5 h-5 text-white/80 hover:rotate-180 transition-transform duration-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                </button>
+            </div>
+        </div>
+    </nav>
+
+    <!-- ========== 主内容区 (最大宽度限制) ========== -->
+    <main class="max-w-[1400px] mx-auto mt-[72px] mb-8 px-6">
+
+        <!-- ==================== 模块1: 设备管理 ==================== -->
+        <section id="module-devices" class="module active">
+            <!-- 头部 -->
+            <div class="flex items-center justify-between pb-4 mb-6 border-b-2 border-slate-200">
+                <h2 class="text-xl font-bold text-slate-800 flex items-center gap-3">
+                    <svg class="w-6 h-6 text-brand-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>
+                    设备管理中心
+                </h2>
+                <div class="flex gap-3">
+                    <button id="btnScan" onclick="toggleScan()" class="px-4 py-2 bg-brand-500 hover:bg-brand-600 text-white rounded-lg text-sm font-medium transition-colors">
+                        扫描设备
+                    </button>
+                    <button id="btnStopAutoScan" onclick="stopAutoScan()" style="display:none;" class="px-4 py-2 bg-amber-500 hover:bg-amber-600 text-white rounded-lg text-sm font-medium transition-colors">
+                        停止自动扫描
+                    </button>
+                    <button onclick="refreshDevices()" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 border border-slate-200 rounded-lg text-sm font-medium transition-colors">
+                        刷新
+                    </button>
+                </div>
+            </div>
+
+            <!-- 统计卡片 -->
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+                <div class="stat-card-online bg-white rounded-xl p-5 shadow-sm border-l-4 border-emerald-500 hover:-translate-y-0.5 transition-transform">
+                    <div class="stat-number text-3xl font-extrabold text-slate-800" id="deviceOnlineCount">0</div>
+                    <div class="stat-label text-sm text-slate-500 mt-1">在线设备</div>
+                </div>
+                <div class="stat-card-offline bg-white rounded-xl p-5 shadow-sm border-l-4 border-red-400 hover:-translate-y-0.5 transition-transform">
+                    <div class="stat-number text-3xl font-extrabold text-slate-800" id="deviceOfflineCount">0</div>
+                    <div class="stat-label text-sm text-slate-500 mt-1">离线设备</div>
+                </div>
+                <div class="stat-card-total bg-white rounded-xl p-5 shadow-sm border-l-4 border-violet-500 hover:-translate-y-0.5 transition-transform">
+                    <div class="stat-number text-3xl font-extrabold text-slate-800" id="deviceTotalCount">0</div>
+                    <div class="stat-label text-sm text-slate-500 mt-1">总设备数</div>
+                </div>
+            </div>
+
+            <!-- 设备表格 -->
+            <div class="bg-white rounded-xl shadow-sm overflow-hidden">
+                <table class="w-full data-table">
+                    <thead class="bg-slate-900 text-white">
+                        <tr>
+                            <th class="py-3.5 px-4 text-left text-xs font-semibold uppercase tracking-wide">状态 / 运营商</th>
+                            <th class="py-3.5 px-4 text-left text-xs font-semibold uppercase tracking-wide">NO.</th>
+                            <th class="py-3.5 px-4 text-left text-xs font-semibold uppercase tracking-wide">设备型号</th>
+                            <th class="py-3.5 px-4 text-left text-xs font-semibold uppercase tracking-wide">备注名称</th>
+                            <th class="py-3.5 px-4 text-left text-xs font-semibold uppercase tracking-wide">通信端口</th>
+                            <th class="py-3.5 px-4 text-left text-xs font-semibold uppercase tracking-wide">最后活跃</th>
+                            <th class="py-3.5 px-4 text-left text-xs font-semibold uppercase tracking-wide">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="deviceListBody">
+                        <tr class="empty-row">
+                            <td colspan="7" class="text-center py-16">
+                                <div class="empty-state">
+                                    <svg class="w-16 h-16 mx-auto mb-4 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>
+                                <p class="text-base text-slate-600">暂无设备连接</p>
+                                <p class="text-sm text-slate-400 mt-1">请连接 Air780E 模组后点击「扫描设备」（每个端口最多探测 15 秒）</p>
+                                </div>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- ==================== 模块2: 短信收发 (聊天式布局) ==================== -->
+        <section id="module-sms" class="module">
+            <div class="chat-layout grid grid-cols-[300px_1fr] grid-rows-1 bg-white rounded-xl shadow-lg overflow-hidden h-[calc(100vh-104px)]">
+                
+                <!-- 左侧：会话列表 -->
+                <aside class="conversation-sidebar bg-slate-900 flex flex-col border-r border-white/10">
+                    <div class="sidebar-header p-4 border-b border-white/10">
+                        <h3 class="text-white text-sm font-semibold mb-3 flex items-center gap-2">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8h2a2 2 0 012 2v6a2 2 0 01-2 2h-2v4l-4-4H9a1.994 1.994 0 01-1.414-.586m0 0L11 14h4a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2v4l.586-.586z"/></svg>
+                            会话列表
+                        </h3>
+                        <select id="smsDeviceSelect" class="select-device w-full px-3 py-2 bg-white/5 border border-white/20 rounded-lg text-white text-sm outline-none focus:border-brand-500 cursor-pointer">
+                            <option value="">-- 选择设备 --</option>
+                        </select>
+                    </div>
+                    
+                    <div class="search-box p-3">
+                        <input type="text" placeholder="搜索号码或内容..." id="smsSearchInput"
+                               onkeyup="filterConversations()"
+                               class="w-full px-3 py-2 bg-white/5 border border-white/15 rounded-full text-white text-sm outline-none focus:border-brand-500 placeholder:text-white/40">
+                    </div>
+                    
+                    <div class="conversation-list flex-1 min-h-0 overflow-y-auto" id="smsConversationList">
+                        <div class="empty-conversation py-12 text-center text-white/50 text-sm">请先选择设备</div>
+                    </div>
+                </aside>
+
+                <!-- 右侧：聊天区域 -->
+                <div class="chat-main flex flex-col bg-slate-50">
+                    <!-- 聊天头部 -->
+                    <div class="chat-header px-5 py-4 bg-white border-b border-slate-200 flex justify-between items-center">
+                        <span class="contact-phone font-semibold text-slate-800" id="smsChatHeader">选择一个会话开始聊天</span>
+                        <button class="btn-small px-3 py-1.5 bg-slate-100 border border-slate-200 rounded text-xs disabled:opacity-50" 
+                                onclick="clearCurrentSMSHistory()" id="btnClearSmsHistory" disabled>清空记录</button>
+                    </div>
+
+                    <!-- 对话对象标识：绑定到左侧所选号码 -->
+                    <div class="target-bar flex items-center justify-between gap-2 px-5 py-3 bg-white border-b border-slate-200" id="smsTargetBar">
+                        <div class="flex items-center gap-2 min-w-0">
+                            <svg class="w-4 h-4 text-brand-500 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 8h2a2 2 0 012 2v6a2 2 0 01-2 2h-2v4l-4-4H9a1.994 1.994 0 01-1.414-.586m0 0L11 14h4a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2v4l.586-.586z"/></svg>
+                            <span class="text-sm text-slate-500 whitespace-nowrap">对话对象:</span>
+                            <span class="target-number px-3 py-1 bg-brand-500/10 text-brand-600 rounded-full text-sm font-medium truncate" id="smsTargetLabel">未选择</span>
+                        </div>
+                        <button class="btn-new-chat text-xs text-brand-600 hover:text-brand-700 whitespace-nowrap px-2 py-1 rounded hover:bg-brand-500/10 transition-colors" onclick="startNewSMSConversation()" id="btnNewSmsChat">+ 新对话</button>
+                    </div>
+
+                    <!-- 消息区域 -->
+                    <div class="chat-messages flex-1 min-h-0 overflow-y-auto p-5 scroll-smooth" id="smsMessagesArea">
+                        <div class="chat-placeholder h-full flex flex-col items-center justify-center text-slate-400">
+                            <svg class="w-20 h-20 mb-4 opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/></svg>
+                            <p>从左侧选择联系人开始对话</p>
+                            <p class="text-sm mt-1 text-slate-300">或使用下方输入框发送新短信</p>
+                        </div>
+                    </div>
+
+                    <!-- 输入区域 -->
+                    <div class="chat-input-area p-5 bg-white border-t border-slate-200">
+                        <div class="input-row flex items-center gap-3 mb-3" id="smsPhoneRow" style="display:none;">
+                            <label class="input-label text-sm text-slate-500 whitespace-nowrap">目标号码:</label>
+                            <input type="tel" id="smsTargetPhone" class="input-phone flex-1 px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/10"
+                                   placeholder="+86xxxxxxxxxxx" onfocus="onPhoneFocus(this)">
+                        </div>
+                        <div class="textarea-row relative mb-3">
+                            <textarea id="smsMessageText" class="input-message w-full px-3 py-3 border border-slate-200 rounded-lg text-sm resize-none outline-none min-h-[80px] max-h-[150px] focus:border-brand-500 focus:ring-2 focus:ring-brand-500/10"
+                                      placeholder="输入短信内容..." maxlength="500" oninput="updateCharCount()"></textarea>
+                            <div class="char-count absolute bottom-2 right-3 text-xs text-slate-400"><span id="smsCharCount">0</span>/500</div>
+                        </div>
+                        <div class="send-button-row flex justify-end">
+                            <button onclick="sendSMS()" id="btnSendSMS" 
+                                    class="btn-send inline-flex items-center gap-2 px-5 py-2.5 bg-emerald-500 hover:bg-emerald-600 text-white rounded-lg text-sm font-semibold transition-all hover:-translate-y-0.5 disabled:opacity-60 disabled:cursor-not-allowed">
+                                发送短信
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/></svg>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ==================== 模块3: 通话中心 (聊天式布局) ==================== -->
+        <section id="module-call" class="module">
+            <div class="chat-layout grid grid-cols-[300px_1fr] grid-rows-1 bg-white rounded-xl shadow-lg overflow-hidden h-[calc(100vh-104px)]">
+                
+                <!-- 左侧：通话记录列表 -->
+                <aside class="conversation-sidebar call-sidebar bg-slate-900 flex flex-col border-r border-white/10">
+                    <div class="sidebar-header p-4 border-b border-white/10">
+                        <h3 class="text-white text-sm font-semibold mb-3 flex items-center gap-2">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"/></svg>
+                            通话记录
+                        </h3>
+                        <select id="callDeviceSelect" class="select-device w-full px-3 py-2 bg-white/5 border border-white/20 rounded-lg text-white text-sm outline-none focus:border-violet-500 cursor-pointer">
+                            <option value="">-- 选择设备 --</option>
+                        </select>
+                    </div>
+                    
+                    <!-- 筛选标签 -->
+                    <div class="call-filter-tabs flex p-2 gap-0 bg-black/20">
+                        <button class="filter-tab flex-1 px-2 py-2 bg-transparent border-none text-white/60 text-xs cursor-pointer rounded-md hover:bg-white/10 hover:text-white transition-all active" data-type="all">全部</button>
+                        <button class="filter-tab flex-1 px-2 py-2 bg-transparent border-none text-white/60 text-xs cursor-pointer rounded-md hover:bg-white/10 hover:text-white transition-all" data-type="incoming">来电</button>
+                        <button class="filter-tab flex-1 px-2 py-2 bg-transparent border-none text-white/60 text-xs cursor-pointer rounded-md hover:bg-white/10 hover:text-white transition-all" data-type="outgoing">去电</button>
+                        <button class="filter-tab flex-1 px-2 py-2 bg-transparent border-none text-white/60 text-xs cursor-pointer rounded-md hover:bg-white/10 hover:text-white transition-all" data-type="missed">未接</button>
+                    </div>
+                    
+                    <div class="conversation-list flex-1 min-h-0 overflow-y-auto" id="callRecordList">
+                        <div class="empty-conversation py-12 text-center text-white/50 text-sm">请先选择设备</div>
+                    </div>
+                </aside>
+
+                <!-- 右侧：详情+拨号盘 -->
+                <div class="chat-main flex flex-col bg-slate-50">
+                    <div class="chat-header px-5 py-4 bg-white border-b border-slate-200">
+                        <span class="contact-phone font-semibold text-slate-800" id="callDetailHeader">通话控制中心</span>
+                    </div>
+
+                    <!-- 详情与拨号盘：左右排列 -->
+                    <div class="call-content flex flex-1 min-h-0">
+
+                    <!-- 详情区域（左） -->
+                    <div class="chat-messages call-messages-area flex-1 min-h-0 overflow-y-auto p-5" id="callRecordsArea">
+                        <div class="chat-placeholder h-full flex flex-col items-center justify-center text-slate-400">
+                            <svg class="w-20 h-20 mb-4 opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"/></svg>
+                            <p>选择左侧记录查看详情</p>
+                            <p class="text-sm mt-1 text-slate-300">或直接拨打电话号码</p>
+                        </div>
+                    </div>
+
+                    <!-- 拨号盘（右） -->
+                    <div class="call-control-area w-[360px] shrink-0 p-5 bg-gradient-to-b from-white to-slate-100 border-l border-slate-200 overflow-y-auto">
+                        <div class="dialpad-container max-w-[320px] mx-auto">
+                            <div class="dial-display-wrap relative mb-4">
+                                <input type="text" id="dialDisplay" readonly
+                                       class="dial-display w-full pl-4 pr-12 py-3 border-2 border-slate-200 rounded-xl text-2xl text-center tracking-wider bg-white outline-none focus:border-violet-500 font-mono">
+                                <button type="button" onclick="deleteDialChar()" id="dialDeleteBtn"
+                                        class="dial-delete absolute right-2 top-1/2 -translate-y-1/2 w-9 h-9 flex items-center justify-center rounded-full text-slate-400 outline-none hover:text-red-500 hover:bg-red-50 active:scale-90 transition-all disabled:opacity-30 disabled:cursor-not-allowed"
+                                        title="删除" disabled>
+                                    <svg xmlns="http://w3.org" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <path d="M21 4H8l-7 8 7 8h13a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2z"></path>
+                                        <path d="m17 10-6 6"></path>
+                                        <path d="m11 10 6 6"></path>
+                                    </svg>
+                                </button>
+                            </div>
+                            
+                            <div class="dialpad-grid grid grid-cols-3 gap-2.5 mb-4">
+                                <button class="dial-key aspect-square cursor-pointer relative" onclick="dialKey('1')"><span class="key-num">1</span></button>
+                                <button class="dial-key aspect-square cursor-pointer relative" onclick="dialKey('2')"><span class="key-num">2</span><span class="key-sub">ABC</span></button>
+                                <button class="dial-key aspect-square cursor-pointer relative" onclick="dialKey('3')"><span class="key-num">3</span><span class="key-sub">DEF</span></button>
+                                <button class="dial-key aspect-square cursor-pointer relative" onclick="dialKey('4')"><span class="key-num">4</span><span class="key-sub">GHI</span></button>
+                                <button class="dial-key aspect-square cursor-pointer relative" onclick="dialKey('5')"><span class="key-num">5</span><span class="key-sub">JKL</span></button>
+                                <button class="dial-key aspect-square cursor-pointer relative" onclick="dialKey('6')"><span class="key-num">6</span><span class="key-sub">MNO</span></button>
+                                <button class="dial-key aspect-square cursor-pointer relative" onclick="dialKey('7')"><span class="key-num">7</span><span class="key-sub">PQRS</span></button>
+                                <button class="dial-key aspect-square cursor-pointer relative" onclick="dialKey('8')"><span class="key-num">8</span><span class="key-sub">TUV</span></button>
+                                <button class="dial-key aspect-square cursor-pointer relative" onclick="dialKey('9')"><span class="key-num">9</span><span class="key-sub">WXYZ</span></button>
+                                <button class="dial-key aspect-square cursor-pointer relative" onclick="dialKey('*')"><span class="key-num">*</span></button>
+                                <button class="dial-key aspect-square cursor-pointer relative" onclick="dialKey('0')"><span class="key-num">0</span><span class="key-sub">+</span></button>
+                                <button class="dial-key aspect-square cursor-pointer relative" onclick="dialKey('#')"><span class="key-num">#</span></button>
+                            </div>
+                            
+                            <div class="dial-actions grid grid-cols-2 gap-3">
+                                <button onclick="makeCall()" class="btn-call btn-dial py-3 px-4 bg-emerald-500 hover:bg-emerald-600 text-white rounded-lg text-base font-semibold transition-colors flex items-center justify-center gap-2">
+                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"/></svg>
+                                    拨号
+                                </button>
+                                <button onclick="hangupCall()" class="btn-hangup btn-dial py-3 px-4 bg-red-500 hover:bg-red-600 text-white rounded-lg text-base font-semibold transition-colors flex items-center justify-center gap-2">
+                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 8l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2M5 3a2 2 0 00-2 2v1c0 8.284 6.716 15 15 15h1a2 2 0 002-2v-3.28a1 1 0 00-.684-.948l-4.493-1.498a1 1 0 00-1.21.502l-1.13 2.257a11.042 11.042 0 01-5.516-5.517l2.257-1.128a1 1 0 00.502-1.21L9.228 3.683A1 1 0 008.279 3H5z"/></svg>
+                                    挂断
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ==================== 模块4: 系统日志 ==================== -->
+        <section id="module-logs" class="module">
+            <!-- 头部 -->
+            <div class="flex items-center justify-between pb-4 mb-6 border-b-2 border-slate-200">
+                <h2 class="text-xl font-bold text-slate-800 flex items-center gap-3">
+                    <svg class="w-6 h-6 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+                    系统日志中心
+                </h2>
+                <div class="flex items-center gap-3">
+                    <span class="text-sm text-slate-500">共 <strong id="logTotalCount" class="text-slate-800">0</strong> 条</span>
+                    <button onclick="clearLogs()" class="px-3 py-1.5 bg-red-50 hover:bg-red-100 text-red-600 rounded-lg text-sm font-medium transition-colors">清空</button>
+                    <button onclick="refreshLogs()" class="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 border border-slate-200 rounded-lg text-sm font-medium transition-colors">刷新</button>
+                </div>
+            </div>
+
+            <!-- 筛选栏 -->
+            <div class="log-toolbar flex items-center justify-between p-4 bg-white rounded-xl mb-4 gap-4">
+                <div class="toolbar-left flex gap-3 flex-1">
+                    <input type="text" class="search-input px-4 py-2 border border-slate-200 rounded-full text-sm outline-none w-[250px] focus:border-amber-500 focus:ring-2 focus:ring-amber-500/10" 
+                           placeholder="搜索关键词..." id="logSearchInput" onkeyup="filterLogs()">
+                    <select class="level-select px-3 py-2 border border-slate-200 rounded-full text-sm outline-none bg-white cursor-pointer" id="logLevelFilter" onchange="filterLogs()">
+                        <option value="">所有级别</option>
+                        <option value="DEBUG">DEBUG</option>
+                        <option value="INFO">INFO</option>
+                        <option value="WARNING">WARNING</option>
+                        <option value="ERROR">ERROR</option>
+                        <option value="CRITICAL">CRITICAL</option>
+                    </select>
+                </div>
+                <div class="toolbar-right">
+                    <label class="checkbox-label flex items-center gap-2 text-sm text-slate-500 cursor-pointer">
+                        <input type="checkbox" id="autoScrollLogs" checked onchange="toggleAutoScroll()" class="accent-brand-500">
+                        自动滚动
+                    </label>
+                </div>
+            </div>
+
+            <!-- 日志容器 -->
+            <div class="log-container bg-slate-900 rounded-xl p-4 min-h-[350px] max-h-[550px] overflow-y-auto font-mono text-[13px] leading-relaxed" id="logsContainer">
+                <div class="log-empty text-center py-16 text-white/30">等待日志数据...</div>
+            </div>
+
+            <!-- 分页 -->
+            <div class="pagination flex items-center justify-between py-4 text-sm text-slate-500">
+                <span class="page-info">显示 <strong id="logShowingCount" class="text-slate-800">0</strong> 条</span>
+                <div class="page-controls flex items-center gap-2">
+                    <button onclick="prevLogPage()" id="btnPrevLogPage" disabled class="btn-page px-3 py-1.5 border border-slate-200 bg-white rounded text-sm cursor-pointer hover:bg-brand-500 hover:text-white hover:border-brand-500 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">上一页</button>
+                    <span class="page-numbers px-3 py-1.5" id="logPageNumbers"></span>
+                    <button onclick="nextLogPage()" id="btnNextLogPage" disabled class="btn-page px-3 py-1.5 border border-slate-200 bg-white rounded text-sm cursor-pointer hover:bg-brand-500 hover:text-white hover:border-brand-500 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">下一页</button>
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+    <!-- ========== 弹窗: 设备备注 ========== -->
+    <div class="modal-overlay fixed inset-0 bg-black/50 hidden items-center justify-center z-[2000] backdrop-blur-sm" id="remarkModal">
+        <div class="modal-dialog modal-sm bg-white rounded-2xl w-[90%] max-w-[380px] shadow-2xl animate-modal-in">
+            <div class="modal-header flex items-center justify-between p-5 border-b border-slate-200">
+                <h3 class="text-lg font-semibold text-slate-800">设置设备备注</h3>
+                <button onclick="closeModal('remarkModal')" class="modal-close w-8 h-8 flex items-center justify-center rounded-full text-slate-400 hover:bg-slate-100 hover:text-slate-600 transition-colors text-2xl">&times;</button>
+            </div>
+            <div class="modal-body p-5">
+                <div class="form-group mb-5">
+                    <label class="block text-sm font-medium text-slate-700 mb-2">设备标识</label>
+                    <input type="text" id="remarkImei" readonly class="form-input w-full px-4 py-2.5 border border-slate-200 rounded-lg text-sm bg-slate-100 outline-none">
+                </div>
+                <div class="form-group mb-0">
+                    <label class="block text-sm font-medium text-slate-700 mb-2">备注名称</label>
+                    <input type="text" id="remarkName" placeholder="例如: 主设备、测试机、门店A"
+                           class="form-input w-full px-4 py-2.5 border border-slate-200 rounded-lg text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/10 transition-all" maxlength="50">
+                </div>
+            </div>
+            <div class="modal-footer flex justify-end gap-3 p-4 border-t border-slate-200 bg-slate-50 rounded-b-2xl">
+                <button onclick="closeModal('remarkModal')" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 border border-slate-200 rounded-lg text-sm font-medium transition-colors">取消</button>
+                <button onclick="saveRemark()" class="px-4 py-2 bg-brand-500 hover:bg-brand-600 text-white rounded-lg text-sm font-medium transition-all hover:-translate-y-0.5 hover:shadow-lg">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ========== Toast 容器 ========== -->
+    <div id="toastContainer" class="toast-container fixed top-[88px] right-6 z-[3000] flex flex-col gap-2"></div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

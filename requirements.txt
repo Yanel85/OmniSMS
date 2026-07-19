@@ -1,0 +1,12 @@
+# OmniSMS Python 依赖
+# 安装: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+# ---- Web 框架与 ASGI 服务器 ----
+fastapi>=0.104.0        # REST API + WebSocket (/ws/log 实时推送)
+uvicorn>=0.24.0         # 程序入口 web.py 通过 uvicorn.run 启动
+websockets>=12.0        # FastAPI WebSocket 支持（/ws/log 实时事件与日志）
+jinja2>=3.1.2           # 服务端模板渲染 (Jinja2Templates -> templates/index.html)
+pydantic>=2.5.0         # 请求/响应数据模型 (BaseModel / Field)
+
+# ---- 设备通信 ----
+pyserial>=3.5           # 串口通信 (import serial)，连接 Air780 家族模组 (/dev/ttyACM*)
