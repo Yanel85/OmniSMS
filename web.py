@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OmniSMS Web Management Interface
+OmniSMS设备与通讯管理系统 v2.0.0- Air780系列设备短信通话融合管理程序
 基于 FastAPI + Tailwind CSS 的 Web 管理界面
 """
 
@@ -63,9 +63,9 @@ def normalize_outgoing_phone(raw: str) -> str:
 
 # ==================== FastAPI 应用 ====================
 app = FastAPI(
-    title="OmniSMS Web Manager",
-    description="OmniSMS 设备管理界面",
-    version="1.0.0"
+    title="OmniSMS",
+    description="Air780系列设备短信通话融合管理程序",
+    version="2.0.0"
 )
 
 # 模板和静态文件（使用绝对路径）
@@ -769,7 +769,7 @@ if __name__ == "__main__":
     import argparse
     
     # 命令行参数解析
-    parser = argparse.ArgumentParser(description="OmniSMS Web Interface")
+    parser = argparse.ArgumentParser(description="OmniSMS设备与通讯管理系统 - Web 管理界面")
     parser.add_argument("--host", type=str, default=WEB_HOST, help="Web 服务监听地址")
     parser.add_argument("--port", type=int, default=WEB_PORT, help="Web 服务端口")
     args = parser.parse_args()
@@ -779,7 +779,7 @@ if __name__ == "__main__":
     WEB_PORT = args.port
     
     print("=" * 60)
-    print("OmniSMS Web Interface Starting...")
+    print("OmniSMS设备与通讯管理系统 -  Web Interface Starting...")
     print(f"Access: http://{WEB_HOST}:{WEB_PORT}")
     print("=" * 60)
     
