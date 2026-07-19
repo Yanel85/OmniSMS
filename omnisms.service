@@ -1,0 +1,18 @@
+[Unit]
+Description=OmniSMS Service (SMS / Device Management)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__PROJECT_DIR__
+# run 命令会自行确保虚拟环境存在并以前台方式启动
+ExecStart=__PROJECT_DIR__/omnisms.sh run
+Restart=on-failure
+RestartSec=5
+User=__USER__
+StandardOutput=append:__PROJECT_DIR__/omnisms.log
+StandardError=append:__PROJECT_DIR__/omnisms.log
+
+[Install]
+WantedBy=multi-user.target
