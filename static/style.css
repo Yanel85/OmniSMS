@@ -243,6 +243,20 @@
 .no-phone {
     font-variant-numeric: tabular-nums;
 }
+/* 无卡徽标: 设备已连接但无 SIM 卡 */
+.no-card-badge {
+    display: inline-block;
+    margin-left: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #b45309;
+    background: #fffbeb;
+    border: 1px solid #fde68a;
+    padding: 1px 7px;
+    border-radius: 9999px;
+    white-space: nowrap;
+    vertical-align: middle;
+}
 /* 设备型号单元格 */
 .model-cell {
     vertical-align: middle;

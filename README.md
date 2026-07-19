@@ -209,10 +209,10 @@ sudo ./omnisms.sh uninstall-service # 卸载服务 (需 root)
 | POST | `/api/scan/auto/start` | 启动后台自动扫描（引擎启动时已默认开启） |
 | POST | `/api/scan/auto/stop` | 停止后台自动扫描（不影响已注册设备） |
 | POST | `/api/sms/send` | 发送短信 `{device_id, phone, text}` |
-| GET | `/api/sms/conversations?device_id=` | 短信会话（按号码聚合） |
-| GET | `/api/sms/messages?device_id=&peer_phone=` | 某会话全部消息 |
-| GET | `/api/calls?device_id=` | 通话记录（扁平） |
-| GET | `/api/calls/conversations?device_id=` | 通话会话（按号码聚合） |
+| GET | `/api/sms/conversations?device_id=` | 短信记录（扁平，peer_phone 原样返回；聚合与展示由前端完成） |
+| GET | `/api/sms/messages?device_id=&peer_phone=` | 某原始号码的全部消息（精确匹配） |
+| GET | `/api/calls?device_id=` | 通话记录（扁平，peer_phone 原样返回；聚合与展示由前端完成） |
+| GET | `/api/calls/conversations?device_id=` | 通话记录（扁平，同 `/api/calls`） |
 | POST | `/api/call/dial`（`/api/call/make`） | 拨号 `{device_id, phone}` |
 | POST | `/api/call/hangup` | 挂断 `{device_id}` |
 | GET | `/api/logs` | 历史日志（过滤/分页） |

@@ -48,22 +48,18 @@ def _parse_bands(raw) -> List[int]:
 
 
 def normalize_outgoing_phone(raw: str) -> str:
-    """外发号码补全: 未带 '+' 国际前缀时默认补 '+86'; 已带 '+' 视为显式国际号码原样使用。
+    """外发号码规范化: 默认不进行 +86 国家码补全。
 
-    - '10010'        -> '+8610010'
-    - '13800138000'  -> '+8613800138000'
-    - '8610010'      -> '+8610010'   (已含国家码, 仅补 '+')
-    - '+1 202 555'   -> '+1202555'   (显式国际号码, 仅去除分隔符)
+    仅去除常见分隔符(空格/连字符/括号/点), 并保留用户显式写出的 '+' 国际前缀;
+    未带 '+' 的号码按原样下发 (不自动补 +86), 交由固件/运营商按本地规则处理。
+
+    - '10010'        -> '10010'        (不补 +86, 原样下发)
+    - '13800138000'  -> '13800138000'
+    - '8610010'      -> '8610010'
+    - '+1 202 555'   -> '+1202555'     (显式国际号码, 仅去除分隔符)
     """
     s = re.sub(r"[\s\-\(\)\.]", "", str(raw).strip())
-    if s.startswith("+"):
-        return s
-    digits = re.sub(r"\D", "", s)
-    if not digits:
-        return s
-    if digits.startswith("86"):
-        return "+" + digits          # 已含国家码, 仅补 '+'
-    return "+86" + digits            # 默认中国区号
+    return s
 
 # ==================== FastAPI 应用 ====================
 app = FastAPI(
@@ -129,6 +125,13 @@ class MakeCallRequest(BaseModel):
 
 class HangupCallRequest(BaseModel):
     device_id: str
+
+
+class PurgeSMSRequest(BaseModel):
+    device_id: Optional[str] = None   # 为空表示跨所有设备清空该号码
+    phone: str
+    confirm: bool = False             # 严格的确认机制: 必须显式确认才执行实际删除
+    dry_run: bool = False             # 仅统计不删除
 
 
 # ==================== 初始化引擎 ====================
@@ -330,6 +333,7 @@ async def get_devices():
             "imei": getattr(device, 'imei', None),
             "iccid": getattr(device, 'iccid', None),
             "imsi": getattr(device, 'imsi', None),
+            "no_card": getattr(device, 'no_card', False),
             "csq": getattr(device, 'csq', None),
             "bands": _parse_bands(getattr(device, 'bands', None)),
             "port": getattr(device, 'at_port', None) or getattr(device, 'port', None),
@@ -356,6 +360,7 @@ async def get_devices():
                     "imei": d.get("imei"),
                     "iccid": d.get("iccid"),
                     "imsi": d.get("imsi"),
+                    "no_card": not (d.get("phone") or d.get("imsi")),
                     "csq": d.get("csq"),
                     "bands": _parse_bands(d.get("bands")),
                     "port": d.get("at_port") or d.get("log_port"),
@@ -515,6 +520,8 @@ async def get_device(device_id: str):
             "phone": getattr(device, 'phone', '') or '',
             "imei": device.imei,
             "iccid": device.iccid,
+            "imsi": getattr(device, 'imsi', None),
+            "no_card": getattr(device, 'no_card', False),
             "at_port": device.at_port,
             "log_port": device.log_port,
             "status": device.status,
@@ -531,6 +538,14 @@ async def send_sms(request: SendSMSRequest):
     if not engine:
         raise HTTPException(status_code=500, detail="Engine not initialized")
     
+    # 无卡设备(既无号码也无 IMSI, device_id 回退 IMEI)短信功能不可用
+    dev = engine.get_device(request.device_id)
+    if dev and getattr(dev, 'no_card', False):
+        return JSONResponse(status_code=400, content={
+            "success": False,
+            "message": "设备无卡，短信功能不可用"
+        })
+    
     phone = normalize_outgoing_phone(request.phone)
     task_id = engine.send_sms(request.device_id, phone, request.text)
     return JSONResponse(content={
@@ -538,6 +553,27 @@ async def send_sms(request: SendSMSRequest):
         "message": "短信发送命令已下发",
         "data": {"task_id": task_id}
     })
+
+
+@app.post("/api/sms/purge")
+async def purge_sms(request: PurgeSMSRequest):
+    """彻底清空指定号码的短信记录 (事务 + 二次查询验证 + 回滚)
+
+    严格的确认机制: confirm 必须为 True 才执行实际删除, 否则返回 NEEDS_CONFIRMATION。
+    返回结果含 success / status / before_count / after_count / deleted_count 等明确状态。
+    """
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not initialized")
+
+    result = db.purge_sms_by_phone(
+        device_id=request.device_id,
+        phone=request.phone,
+        confirm=request.confirm,
+        dry_run=request.dry_run,
+    )
+    # 验证失败 / 异常 / 参数错误 -> 409; 其余 (成功/预览/需确认) -> 200
+    http_status = 409 if result["status"] in ("FAILED_VERIFICATION", "ERROR", "INVALID_PARAM") else 200
+    return JSONResponse(status_code=http_status, content=result)
 
 
 # ==================== 设备备注 ====================
@@ -568,12 +604,12 @@ async def save_device_remark(request: RemarkRequest):
 
 @app.get("/api/sms/conversations")
 async def get_sms_conversations(device_id: str = Query(..., description="设备标识(device_id)")):
-    """获取某设备的短信会话列表 (按号码分组)"""
+    """获取某设备的全部短信记录 (扁平, 原样返回 peer_phone; 聚合与展示格式化由前端完成)"""
     if db is None:
         raise HTTPException(status_code=500, detail="Database not initialized")
     
-    conversations = db.get_sms_conversations(device_id)
-    return JSONResponse(content={"success": True, "conversations": conversations})
+    messages = db.get_sms_all(device_id)
+    return JSONResponse(content={"success": True, "messages": messages})
 
 
 @app.get("/api/sms/messages")
@@ -603,12 +639,12 @@ async def get_call_records(device_id: str = Query(..., description="设备标识
 
 @app.get("/api/calls/conversations")
 async def get_call_conversations(device_id: str = Query(..., description="设备标识(device_id)")):
-    """获取某设备的通话会话列表 (按号码分组聚合)"""
+    """获取某设备的通话记录 (扁平, 原样返回 peer_phone; 聚合与展示格式化由前端完成)"""
     if db is None:
         raise HTTPException(status_code=500, detail="Database not initialized")
     
-    conversations = db.get_call_conversations(device_id)
-    return JSONResponse(content={"success": True, "conversations": conversations})
+    records = db.get_calls(device_id)
+    return JSONResponse(content={"success": True, "conversations": records})
 
 
 @app.post("/api/call/make")
@@ -617,6 +653,14 @@ async def make_call(request: MakeCallRequest):
     """拨打电话"""
     if not engine:
         raise HTTPException(status_code=500, detail="Engine not initialized")
+    
+    # 无卡设备(既无号码也无 IMSI, device_id 回退 IMEI)通话功能不可用
+    dev = engine.get_device(request.device_id)
+    if dev and getattr(dev, 'no_card', False):
+        return JSONResponse(status_code=400, content={
+            "success": False,
+            "message": "设备无卡，通话功能不可用"
+        })
     
     phone = normalize_outgoing_phone(request.phone)
     success = engine.make_call(request.device_id, phone)
@@ -634,6 +678,14 @@ async def hangup_call(request: HangupCallRequest):
     """挂断电话"""
     if not engine:
         raise HTTPException(status_code=500, detail="Engine not initialized")
+    
+    # 无卡设备通话功能不可用
+    dev = engine.get_device(request.device_id)
+    if dev and getattr(dev, 'no_card', False):
+        return JSONResponse(status_code=400, content={
+            "success": False,
+            "message": "设备无卡，通话功能不可用"
+        })
     
     success = engine.hangup_call(request.device_id)
     if success:

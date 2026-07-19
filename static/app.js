@@ -6,11 +6,12 @@
 // ==================== 全局状态 ====================
 const AppState = {
     devices: new Map(),           // IMEI -> DeviceInfo
-    selectedDevice: null,        // 当前选中的设备 IMEI
-    smsConversations: {},        // { deviceImei: { phone: [messages] } }  (完整消息, 选中会话后加载)
-    smsConvMeta: {},             // { deviceImei: [ {phone,count,last_message,last_direction,last_time} ] }  (号码级聚合)
-    callRecords: {},             // { deviceImei: [records] }  (扁平通话记录)
-    callConversations: {},       // { deviceImei: [ {phone,count,last_type,...} ] }  (号码级聚合)
+    selectedDevice: null,        // 当前选中的标识: 短信/通话模块均为 SIM(手机号/IMSI), 通讯记录按 SIM 归类
+    smsMessages: {},            // { simKey: [ 扁平原始短信记录(peer_phone 原样) ] }  simKey = device_id(手机号/IMSI/IMEI兜底), 短信按 SIM 归类
+    smsConversations: {},        // { simKey: { normKey: [messages] } }  (按归一化键聚合后的会话消息, 供聊天视图)
+    smsConvMeta: {},             // { simKey: [ {peer_phone:normKey,count,last_message,last_direction,last_time} ] }  (号码级聚合, 供左侧列表)
+    callRecords: {},             // { simKey: [records] }  (扁平通话记录, 按 SIM 归类)
+    callConversations: {},       // { simKey: [ {phone,count,last_type,...} ] }  (号码级聚合, 按 SIM 归类)
     callViewMode: 'aggregated',  // 'aggregated' | 'flat'  (通话列表视图模式)
     callFilterType: 'all',       // 扁平视图下的类型筛选
     selectedCallPhone: null,     // 当前选中的通话号码 (用于高亮)
@@ -264,6 +265,9 @@ function renderDeviceList() {
         const remark = AppState.deviceRemarks[deviceId] || '';
         const lastActive = device.last_active ? formatTime(new Date(device.last_active)) : '-';
         const deviceLabel = device.phone || device.imei || deviceId;
+        const noCardBadge = device.no_card
+            ? '<span class="no-card-badge" title="设备已连接但无 SIM 卡, 短信与通话功能不可用">无卡</span>'
+            : '';
         
         html += `
             <tr data-device-id="${deviceId}">
@@ -274,7 +278,7 @@ function renderDeviceList() {
                     </div>
                 </td>
                 <td class="no-cell">
-                    <code class="no-phone">${deviceLabel}</code>
+                    <code class="no-phone">${deviceLabel}</code>${noCardBadge}
                     <button class="btn-action btn-danger" onclick="removeDevice('${deviceId}')" title="移除"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg></button>
                 </td>
                 <td class="model-cell">
@@ -320,6 +324,7 @@ function buildDeviceTooltipHTML(device) {
             + `<span class="dt-value">${val}</span></div>`;
     };
     return `<div class="dt-title">设备详细信息</div>`
+        + (device.no_card ? row('SIM 卡', '无卡 (短信/通话不可用)') : '')
         + row('ICCID', device.iccid)
         + row('IMSI', device.imsi)
         + row('IMEI', device.imei)
@@ -592,35 +597,51 @@ async function removeDevice(imei) {
 }
 
 // 快捷跳转
-function gotoSMS(imei) {
-    AppState.selectedDevice = imei;
+function gotoSMS(simKey) {
+    AppState.selectedDevice = simKey;
     document.querySelector('[data-module="sms"]').click();
-    document.getElementById('smsDeviceSelect').value = imei;
-    onSMSDeviceChange();
+    document.getElementById('smsSimSelect').value = simKey;
+    onSMSSimChange();
 }
 
-function gotoCall(imei) {
-    AppState.selectedDevice = imei;
+function gotoCall(simKey) {
+    AppState.selectedDevice = simKey;
     document.querySelector('[data-module="call"]').click();
-    document.getElementById('callDeviceSelect').value = imei;
-    onCallDeviceChange();
+    document.getElementById('callSimSelect').value = simKey;
+    onCallSimChange();
 }
 
-// 刷新设备选择下拉框
+// 判断某 SIM/设备是否为无卡状态(既无号码也无 IMSI, device_id 回退 IMEI, 短信/通话不可用)
+function isDeviceNoCard(key) {
+    const dev = AppState.devices.get(key);
+    return !!(dev && dev.no_card);
+}
+
+// 刷新设备/SIM 选择下拉框
+// 短信与通话模块均按 SIM(手机号/IMSI) 归类, 下拉直接列出 SIM
 function refreshDeviceSelects() {
-    const options = '<option value="">-- 选择设备 --</option>';
-    const smsSelect = document.getElementById('smsDeviceSelect');
-    const callSelect = document.getElementById('callDeviceSelect');
-    
-    let optsHtml = options;
-    AppState.devices.forEach((dev, imei) => {
-        const remark = AppState.deviceRemarks[imei] || (dev.phone || dev.imei || imei);
-        const label = `${remark} (${dev.status})`;
-        optsHtml += `<option value="${imei}">${escapeHtml(label)}</option>`;
+    const smsSelect = document.getElementById('smsSimSelect');
+    const callSelect = document.getElementById('callSimSelect');
+
+    let smsOpts = '<option value="">-- 选择 SIM (手机号/IMSI) --</option>';
+    let callOpts = '<option value="">-- 选择 SIM (手机号/IMSI) --</option>';
+
+    AppState.devices.forEach((dev, deviceId) => {
+        // 以 SIM 标识(手机号 > IMSI > IMEI兜底)作为选项值, 直接选 SIM
+        const simLabel = dev.phone || dev.imsi || dev.imei || deviceId;
+        const simRemark = AppState.deviceRemarks[deviceId] || '';
+        // 无卡状态: 在显示中标注, 但选项仍可选(用于查看, 实际功能后端会拦截)
+        const cardTag = dev.no_card ? ' · 无卡' : '';
+        const simDisplay = (simRemark ? `${simRemark} (${simLabel})` : simLabel) + cardTag;
+        const opt = `<option value="${escapeHtml(deviceId)}">${escapeHtml(`${simDisplay} (${dev.status})`)}</option>`;
+        smsOpts += opt;
+
+        // 通话: 同样按 SIM 归类
+        callOpts += opt;
     });
-    
-    smsSelect.innerHTML = optsHtml;
-    callSelect.innerHTML = optsHtml;
+
+    smsSelect.innerHTML = smsOpts;
+    callSelect.innerHTML = callOpts;
 }
 
 // ==================== 短信模块 (聊天式布局) ====================
@@ -628,50 +649,77 @@ let currentConversationPhone = null;
 
 // 监听设备选择变化
 document.addEventListener('DOMContentLoaded', () => {
-    const smsSelect = document.getElementById('smsDeviceSelect');
+    const smsSelect = document.getElementById('smsSimSelect');
     if (smsSelect) {
-        smsSelect.addEventListener('change', onSMSDeviceChange);
+        smsSelect.addEventListener('change', onSMSSimChange);
     }
 });
 
-async function onSMSDeviceChange() {
-    const imei = document.getElementById('smsDeviceSelect').value;
-    AppState.selectedDevice = imei || null;
+async function onSMSSimChange() {
+    const simKey = document.getElementById('smsSimSelect').value;
+    AppState.selectedDevice = simKey || null;
     currentConversationPhone = null;
     resetSMSSendWindow();
     
-    if (!imei) {
+    if (!simKey) {
         renderConversationList(null);
         clearChatArea('sms');
         return;
     }
     
-    // 从数据库加载该设备的会话聚合 (按号码分组)
-    const result = await apiGet(`/api/sms/conversations?device_id=${encodeURIComponent(imei)}`);
-    AppState.smsConvMeta[imei] = (result && result.conversations) ? result.conversations : [];
-    AppState.smsConversations[imei] = {};  // 完整消息在选中会话时再加载
+    // 短信按 SIM(手机号/IMSI) 归类: 以 simKey(=device_id) 拉取该 SIM 的全部短信(扁平, peer_phone 原样); 聚合与展示格式化在前端完成
+    const result = await apiGet(`/api/sms/conversations?device_id=${encodeURIComponent(simKey)}`);
+    AppState.smsMessages[simKey] = (result && result.messages) ? result.messages : [];
+    aggregateSMSConversations(simKey);
     
-    renderConversationList(imei);
+    renderConversationList(simKey);
     clearChatArea('sms');
 }
 
-// 刷新短信会话聚合列表 (发送/收到后调用, 保证计数与摘要最新)
-async function refreshSMSConversations(imei) {
-    const result = await apiGet(`/api/sms/conversations?device_id=${encodeURIComponent(imei)}`);
-    AppState.smsConvMeta[imei] = (result && result.conversations) ? result.conversations : [];
-    renderConversationList(imei);
+// 刷新短信数据 (发送/收到后调用, 保证计数与摘要最新): 重新拉取扁平记录并前端聚合
+async function refreshSMSConversations(simKey) {
+    if (!simKey) return;
+    const result = await apiGet(`/api/sms/conversations?device_id=${encodeURIComponent(simKey)}`);
+    AppState.smsMessages[simKey] = (result && result.messages) ? result.messages : [];
+    aggregateSMSConversations(simKey);
+    renderConversationList(simKey);
+}
+
+// 前端号码聚合: 将扁平短信记录按归一化键(normalizePhone)分组为会话
+function aggregateSMSConversations(simKey) {
+    const flat = AppState.smsMessages[simKey] || [];
+    const groups = {};  // normKey -> 聚合对象
+    flat.forEach(m => {
+        const key = normalizePhone(m.peer_phone);
+        if (!groups[key]) {
+            groups[key] = { peer_phone: key, messages: [], count: 0, last_time: '', last_message: '', last_direction: 'in' };
+        }
+        const g = groups[key];
+        g.messages.push(m);
+        g.count++;
+        if (!g.last_time || m.time > g.last_time) {
+            g.last_time = m.time;
+            g.last_message = m.text;
+            g.last_direction = (m.direction === 'out' || m.direction === 'sent') ? 'out' : 'in';
+        }
+    });
+    const list = Object.values(groups).sort((a, b) => (b.last_time || '').localeCompare(a.last_time || ''));
+    AppState.smsConvMeta[simKey] = list;
+    // 重建按归一化键索引的会话消息(供聊天视图)
+    AppState.smsConversations[simKey] = {};
+    list.forEach(g => { AppState.smsConversations[simKey][g.peer_phone] = g.messages; });
 }
 
 // 渲染会话列表（左侧）：按号码聚合，仅展示最新一条短信 + 摘要
-function renderConversationList(imei) {
+function renderConversationList(simKey) {
     const container = document.getElementById('smsConversationList');
     
-    if (!imei) {
-        container.innerHTML = '<div class="empty-conversation py-12 text-center text-white/50 text-sm"><p>请先选择设备</p></div>';
+    if (!simKey) {
+        container.innerHTML = '<div class="empty-conversation py-12 text-center text-white/50 text-sm"><p>请先选择 SIM</p></div>';
         return;
     }
     
-    const convos = AppState.smsConvMeta[imei] || [];
+    const convos = AppState.smsConvMeta[simKey] || [];
     
     if (convos.length === 0) {
         container.innerHTML = '<div class="empty-conversation py-12 text-center text-white/50 text-sm"><p>暂无会话记录<br><small class="opacity-70">发送新短信开始对话</small></p></div>';
@@ -722,21 +770,8 @@ async function selectConversation(phone) {
         item.classList.toggle('active', item.dataset.phone === phone);
     });
     
-    // 从数据库加载该会话的完整消息
-    const imei = AppState.selectedDevice;
-    if (imei && AppState.smsConversations[imei]) {
-        const result = await apiGet(`/api/sms/messages?device_id=${encodeURIComponent(imei)}&peer_phone=${encodeURIComponent(phone)}`);
-        if (result && result.messages) {
-            AppState.smsConversations[imei][phone] = result.messages.map(m => ({
-                time: m.time,
-                text: m.text,
-                direction: m.direction,
-                status: m.status
-            }));
-        }
-    }
-    
-    // 渲染聊天消息
+    // 使用前端已聚合的会话消息(后端按原始号码存储, 无需二次请求)
+    // 聚合已在 aggregateSMSConversations 中完成, 此处直接渲染
     renderChatMessages(phone);
     updateChatHeader(phone);
 }
@@ -744,9 +779,9 @@ async function selectConversation(phone) {
 // 渲染聊天消息（右侧）
 function renderChatMessages(phone) {
     const area = document.getElementById('smsMessagesArea');
-    const imei = AppState.selectedDevice;
+    const simKey = AppState.selectedDevice;
     
-    if (!imei || !phone) {
+    if (!simKey || !phone) {
         area.innerHTML = `
             <div class="chat-placeholder h-full flex flex-col items-center justify-center text-slate-400">
                 <svg class="placeholder-icon w-20 h-20 mb-4 opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/></svg>
@@ -756,7 +791,7 @@ function renderChatMessages(phone) {
         return;
     }
     
-    const messages = AppState.smsConversations[imei]?.[phone] || [];
+    const messages = AppState.smsConversations[simKey]?.[phone] || [];
     
     if (messages.length === 0) {
         area.innerHTML = `
@@ -837,12 +872,16 @@ function startNewSMSConversation() {
 
 // 发送短信
 async function sendSMS() {
-    const imei = AppState.selectedDevice;
+    const simKey = AppState.selectedDevice;
     const phone = document.getElementById('smsTargetPhone').value.trim();
     const text = document.getElementById('smsMessageText').value.trim();
     
-    if (!imei) {
-        showToast('请先选择设备', 'error');
+    if (!simKey) {
+        showToast('请先选择 SIM', 'error');
+        return;
+    }
+    if (isDeviceNoCard(simKey)) {
+        showToast('设备无卡，短信功能不可用', 'error');
         return;
     }
     if (!phone) {
@@ -860,16 +899,16 @@ async function sendSMS() {
     btn.disabled = true;
     btn.textContent = '发送中...';
     
-    const result = await apiPost('/api/sms/send', { device_id: imei, phone, text });
+    const result = await apiPost('/api/sms/send', { device_id: simKey, phone, text });
     
     btn.disabled = false;
     btn.innerHTML = '发送短信 <svg class="w-4 h-4 inline ml-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/></svg>';
     
     if (result && result.success && result.data?.task_id) {
         const taskId = result.data.task_id;
-        // 本地历史与会话键统一使用标准化号码, 与后端聚合键保持一致
         const normPhone = normalizePhone(phone);
-        addSMSToHistory(imei, normPhone, text, 'sent', 'pending', taskId);
+        // 原始号码入扁平存储, 会话聚合与展示格式化在前端完成
+        addSMSToHistory(simKey, phone, text, 'sent', 'pending', taskId);
         document.getElementById('smsMessageText').value = '';
         updateCharCount();
         
@@ -879,65 +918,66 @@ async function sendSMS() {
         if (currentConversationPhone === normPhone) {
             renderChatMessages(normPhone);
         }
-        refreshSMSConversations(imei);
+        refreshSMSConversations(simKey);
     } else {
         showToast(result?.detail || result?.message || '发送失败', 'error');
     }
 }
 
-// 添加短信到本地历史
-function addSMSToHistory(imei, phone, text, direction, status = 'delivered', taskId = null, time = null) {
-    if (!AppState.smsConversations[imei]) {
-        AppState.smsConversations[imei] = {};
+// 添加短信到本地扁平历史(乐观更新), 随后触发前端聚合
+function addSMSToHistory(simKey, rawPhone, text, direction, status = 'delivered', taskId = null, time = null) {
+    if (!AppState.smsMessages[simKey]) {
+        AppState.smsMessages[simKey] = [];
     }
-    if (!AppState.smsConversations[imei][phone]) {
-        AppState.smsConversations[imei][phone] = [];
-    }
-    
-    AppState.smsConversations[imei][phone].push({
-        // 优先使用后端统一下发的 UTC 时间戳(已含时区), 确保与数据库一致; 无则回退浏览器本地时钟
+    AppState.smsMessages[simKey].push({
+        // 优先使用后端统一下发的 UTC 时间戳(已含时区); 无则回退浏览器本地时钟
+        peer_phone: rawPhone,
         time: time || new Date().toISOString(),
         text,
         direction,
         status,
         task_id: taskId
     });
+    // 重新聚合(乐观更新), 随后 refreshSMSConversations 会从后端重新拉取并覆盖
+    aggregateSMSConversations(simKey);
 }
 
 // 处理收到的短信事件
 function handleSMSEvent(data) {
     if (data.event === 'sms_received') {
-        const imei = data.device_id || AppState.selectedDevice;
-        if (imei && data.phone && data.text) {
-            // 标准化号码作为会话键, 与后端聚合键一致(避免国家码差异分裂会话)
+        const simKey = data.device_id || AppState.selectedDevice;
+        if (simKey && data.phone && data.text) {
+            // 原始号码入扁平存储, 会话聚合与展示格式化在前端完成
             const normPhone = normalizePhone(data.phone);
-            addSMSToHistory(imei, normPhone, data.text, 'received', 'received', null, data.time);
+            addSMSToHistory(simKey, data.phone, data.text, 'received', 'received', null, data.time);
             
             // 如果当前在查看该会话，立即更新
             if (currentConversationPhone === normPhone) {
                 renderChatMessages(normPhone);
             }
-            refreshSMSConversations(imei);
+            refreshSMSConversations(simKey);
             
             showToast(`收到来自 ${formatPhoneDisplay(data.phone)} 的短信`, 'info');
         }
     } else if (data.event === 'sms_sent_result') {
-        const imei = data.device_id || AppState.selectedDevice;
+        const simKey = data.device_id || AppState.selectedDevice;
         const status = data.status === 'accepted' ? 'pending' :
                        data.status === 'fail' ? 'failed' : data.status;
-        const messages = AppState.smsConversations[imei] || {};
+        const messages = AppState.smsMessages[simKey] || [];
         let updatedPhone = null;
-        Object.entries(messages).forEach(([phone, items]) => {
-            const message = items.find(item => item.task_id === data.id);
-            if (message) {
-                message.status = status;
-                updatedPhone = phone;
+        messages.forEach(m => {
+            if (m.task_id === data.id) {
+                m.status = status;
+                updatedPhone = m.peer_phone;
             }
         });
-        if (updatedPhone && currentConversationPhone === updatedPhone) {
-            renderChatMessages(updatedPhone);
+        if (updatedPhone) {
+            aggregateSMSConversations(simKey);
+            if (currentConversationPhone === normalizePhone(updatedPhone)) {
+                renderChatMessages(currentConversationPhone);
+            }
         }
-        refreshSMSConversations(imei);
+        refreshSMSConversations(simKey);
         if (status === 'failed') {
             const reason = data.reason || `错误码: ${data.error_code ?? '未知'}`;
             showToast(`短信发送失败（${reason}）`, 'error');
@@ -948,18 +988,35 @@ function handleSMSEvent(data) {
 }
 
 // 清空当前会话历史
-function clearCurrentSMSHistory() {
-    const imei = AppState.selectedDevice;
+async function clearCurrentSMSHistory() {
+    const simKey = AppState.selectedDevice;
     const phone = currentConversationPhone;
     
-    if (!imei || !phone) return;
+    if (!simKey || !phone) return;
     
-    if (!confirm('确定要清空与该联系人的聊天记录吗？')) return;
-    
-    delete AppState.smsConversations[imei][phone];
-    renderChatMessages(phone);
-    refreshSMSConversations(imei);
-    showToast('聊天记录已清空', 'success');
+    if (!confirm('确定要彻底清空与该号码的所有短信记录吗？此操作不可恢复')) return;
+
+    const res = await apiPost('/api/sms/purge', {
+        device_id: simKey,
+        phone: phone,
+        confirm: true,
+    });
+
+    if (!res) {
+        showToast('清空失败：无法连接服务器', 'error');
+        return;
+    }
+
+    if (res.success) {
+        if (AppState.smsConversations[simKey]) {
+            delete AppState.smsConversations[simKey][phone];
+        }
+        renderChatMessages(phone);
+        await refreshSMSConversations(simKey);
+        showToast(res.message || '短信记录已彻底清空', 'success');
+    } else {
+        showToast(res.message || '清空失败', 'error');
+    }
 }
 
 // 字数统计
@@ -999,9 +1056,9 @@ function clearChatArea(module) {
 
 // ==================== 通话模块 (聊天式布局) ====================
 document.addEventListener('DOMContentLoaded', () => {
-    const callSelect = document.getElementById('callDeviceSelect');
+    const callSelect = document.getElementById('callSimSelect');
     if (callSelect) {
-        callSelect.addEventListener('change', onCallDeviceChange);
+        callSelect.addEventListener('change', onCallSimChange);
     }
     
     // 通话筛选标签
@@ -1017,50 +1074,66 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 });
 
-async function onCallDeviceChange() {
-    const imei = document.getElementById('callDeviceSelect').value;
-    AppState.selectedDevice = imei || null;
+async function onCallSimChange() {
+    const simKey = document.getElementById('callSimSelect').value;
+    AppState.selectedDevice = simKey || null;
     
     // 重置通话详情头部与高亮状态
     document.getElementById('callDetailHeader').textContent = '通话控制中心';
     document.querySelectorAll('.call-record-item.active').forEach(i => i.classList.remove('active'));
     AppState.selectedCallPhone = null;
     
-    if (imei) {
-        // 从数据库加载通话记录 (扁平) 与号码级聚合会话
-        const [flatRes, convRes] = await Promise.all([
-            apiGet(`/api/calls?device_id=${encodeURIComponent(imei)}`),
-            apiGet(`/api/calls/conversations?device_id=${encodeURIComponent(imei)}`)
-        ]);
-        AppState.callRecords[imei] = (flatRes && flatRes.records) ? flatRes.records : [];
-        AppState.callConversations[imei] = (convRes && convRes.conversations) ? convRes.conversations : [];
+    if (simKey) {
+        // 通话按 SIM(手机号/IMSI) 归类: 以 simKey(=device_id) 拉取该 SIM 的通话记录(扁平, peer_phone 原样); 聚合与展示格式化在前端完成
+        const flatRes = await apiGet(`/api/calls?device_id=${encodeURIComponent(simKey)}`);
+        AppState.callRecords[simKey] = (flatRes && flatRes.records) ? flatRes.records : [];
+        aggregateCallConversations(simKey);
     } else {
         AppState.callRecords = {};
         AppState.callConversations = {};
     }
     
-    renderCallRecordList(imei);
+    renderCallRecordList(simKey);
 }
 
 // 刷新通话数据 (拨号/来电后调用, 保持聚合与扁平数据一致)
-async function refreshCallData(imei) {
-    if (!imei) return;
-    const [flatRes, convRes] = await Promise.all([
-        apiGet(`/api/calls?device_id=${encodeURIComponent(imei)}`),
-        apiGet(`/api/calls/conversations?device_id=${encodeURIComponent(imei)}`)
-    ]);
-    AppState.callRecords[imei] = (flatRes && flatRes.records) ? flatRes.records : [];
-    AppState.callConversations[imei] = (convRes && convRes.conversations) ? convRes.conversations : [];
-    renderCallRecordList(imei);
+async function refreshCallData(simKey) {
+    if (!simKey) return;
+    const flatRes = await apiGet(`/api/calls?device_id=${encodeURIComponent(simKey)}`);
+    AppState.callRecords[simKey] = (flatRes && flatRes.records) ? flatRes.records : [];
+    aggregateCallConversations(simKey);
+    renderCallRecordList(simKey);
 }
 
 // 渲染通话记录列表（左侧）
 // 视图模式: 'aggregated' (按号码聚合, 仅最新一条) | 'flat' (扁平, 按类型筛选)
-function renderCallRecordList(imei) {
+// 前端号码聚合: 将扁平通话记录按归一化键(normalizePhone)分组为会话
+function aggregateCallConversations(simKey) {
+    const flat = AppState.callRecords[simKey] || [];
+    const groups = {};  // normKey -> 聚合对象
+    flat.forEach(r => {
+        const key = normalizePhone(r.peer_phone);
+        if (!groups[key]) {
+            groups[key] = { peer_phone: key, count: 0, last_time: '', last_type: 'incoming', last_status: '', last_duration: 0 };
+        }
+        const g = groups[key];
+        g.count++;
+        if (!g.last_time || r.time > g.last_time) {
+            g.last_time = r.time;
+            g.last_type = r.type;
+            g.last_status = r.status;
+            g.last_duration = r.duration || 0;
+        }
+    });
+    const list = Object.values(groups).sort((a, b) => (b.last_time || '').localeCompare(a.last_time || ''));
+    AppState.callConversations[simKey] = list;
+}
+
+function renderCallRecordList(simKey) {
     const container = document.getElementById('callRecordList');
     
-    if (!imei) {
-        container.innerHTML = '<div class="empty-conversation py-12 text-center text-white/50 text-sm"><p>请先选择设备</p></div>';
+    if (!simKey) {
+        container.innerHTML = '<div class="empty-conversation py-12 text-center text-white/50 text-sm"><p>请先选择 SIM</p></div>';
         return;
     }
     
@@ -1068,7 +1141,7 @@ function renderCallRecordList(imei) {
     
     // ===== 聚合视图：按号码折叠 =====
     if (mode === 'aggregated') {
-        const convos = AppState.callConversations[imei] || [];
+        const convos = AppState.callConversations[simKey] || [];
         if (convos.length === 0) {
             container.innerHTML = '<div class="empty-conversation py-12 text-center text-white/50 text-sm"><p>暂无通话记录</p></div>';
             return;
@@ -1104,7 +1177,7 @@ function renderCallRecordList(imei) {
     
     // ===== 扁平视图：按类型筛选 =====
     const filterType = AppState.callFilterType || 'all';
-    let records = AppState.callRecords[imei] || [];
+    let records = AppState.callRecords[simKey] || [];
     if (filterType !== 'all') {
         records = records.filter(r => r.type === filterType);
     }
@@ -1122,7 +1195,7 @@ function renderCallRecordList(imei) {
         const duration = record.duration ? `${record.duration}秒` : '';
         
         html += `
-            <div class="call-record-item ${typeClass}" data-phone="${escapeHtml(record.peer_phone || '未知号码')}" onclick="showCallDetail('${record.id}')">
+            <div class="call-record-item ${typeClass}" data-phone="${escapeHtml(normalizePhone(record.peer_phone || '未知号码'))}" onclick="showCallDetail('${record.id}')">
                 <div class="call-type-icon">${typeIcon}</div>
                 <div class="call-info">
                     <div class="call-phone">${escapeHtml(formatPhoneDisplay(record.peer_phone) || '未知号码')}</div>
@@ -1148,32 +1221,33 @@ function callTypeIcon(type) {
 
 // 显示通话详情（右侧）：按记录 id 定位号码后展示该号码全部历史
 function showCallDetail(recordId) {
-    const imei = AppState.selectedDevice;
-    const records = AppState.callRecords[imei] || [];
+    const simKey = AppState.selectedDevice;
+    const records = AppState.callRecords[simKey] || [];
     const record = records.find(r => r.id === recordId);
     if (!record) return;
-    showCallConversation(record.peer_phone || '未知号码');
+    // 以归一化键定位会话, 兼容同一联系人的多种原始号码形态
+    showCallConversation(normalizePhone(record.peer_phone) || '未知号码');
 }
 
 // 显示某号码的完整通话历史（右侧）
 function showCallConversation(phone) {
-    const imei = AppState.selectedDevice;
-    const records = AppState.callRecords[imei] || [];
+    const simKey = AppState.selectedDevice;
+    const records = AppState.callRecords[simKey] || [];
     phone = phone || '未知号码';
 
     AppState.selectedCallPhone = phone;
 
-    // 高亮左侧同号码的记录（聚合项与扁平项均生效）
+    // 高亮左侧同号码的记录（聚合项与扁平项均生效, 均按归一化键比较）
     document.querySelectorAll('.call-record-item').forEach(item => {
-        item.classList.toggle('active', item.dataset.phone === phone);
+        item.classList.toggle('active', normalizePhone(item.dataset.phone) === phone);
     });
 
-    // 更新头部标题(带国家码标准格式)
+    // 更新头部标题(带国家码标准格式, 由前端格式化)
     document.getElementById('callDetailHeader').textContent = `通话详情 - ${formatPhoneDisplay(phone)}`;
 
-    // 取出该号码的全部记录（来电 / 去电 / 未接），按时间倒序排列
+    // 取出该号码的全部记录（来电 / 去电 / 未接）, 按归一化键匹配, 按时间倒序排列
     const phoneRecords = records
-        .filter(r => (r.peer_phone || '未知号码') === phone)
+        .filter(r => normalizePhone(r.peer_phone || '未知号码') === phone)
         .sort((a, b) => new Date(b.time) - new Date(a.time));
 
     const area = document.getElementById('callRecordsArea');
@@ -1254,11 +1328,15 @@ function updateDialDeleteState() {
 }
 
 function makeCall() {
-    const imei = AppState.selectedDevice;
+    const simKey = AppState.selectedDevice;
     const phone = document.getElementById('dialDisplay').value.trim();
     
-    if (!imei) {
-        showToast('请先选择设备', 'error');
+    if (!simKey) {
+        showToast('请先选择 SIM', 'error');
+        return;
+    }
+    if (isDeviceNoCard(simKey)) {
+        showToast('设备无卡，通话功能不可用', 'error');
         return;
     }
     if (!phone) {
@@ -1266,38 +1344,42 @@ function makeCall() {
         return;
     }
     
-    dial(imei, phone);
+    dial(simKey, phone);
 }
 
-async function dial(imei, phone) {
-    const result = await apiPost('/api/call/dial', { device_id: imei, phone });
+async function dial(simKey, phone) {
+    const result = await apiPost('/api/call/dial', { device_id: simKey, phone });
     
     if (result && result.task_id) {
         // 添加到通话记录
-        addCallRecord(imei, phone, 'outgoing');
+        addCallRecord(simKey, phone, 'outgoing');
         document.getElementById('dialDisplay').value = '';
         updateDialDeleteState();
         showToast(`正在拨打 ${phone}`, 'info');
-        refreshCallData(imei);
+        refreshCallData(simKey);
     } else {
-        showToast(result?.detail || '拨号失败', 'error');
+        showToast(result?.detail || result?.message || '拨号失败', 'error');
     }
 }
 
 async function hangupCall() {
-    const imei = AppState.selectedDevice;
+    const simKey = AppState.selectedDevice;
     
-    if (!imei) {
-        showToast('请先选择设备', 'error');
+    if (!simKey) {
+        showToast('请先选择 SIM', 'error');
+        return;
+    }
+    if (isDeviceNoCard(simKey)) {
+        showToast('设备无卡，通话功能不可用', 'error');
         return;
     }
     
-    const result = await apiPost('/api/call/hangup', { device_id: imei });
+    const result = await apiPost('/api/call/hangup', { device_id: simKey });
     
     if (result && result.success) {
         showToast('已挂断', 'success');
     } else {
-        showToast(result?.detail || '挂断失败', 'error');
+        showToast(result?.detail || result?.message || '挂断失败', 'error');
     }
 }
 
@@ -1320,12 +1402,12 @@ function sendSMSCall(phone) {
 }
 
 // 添加通话记录
-function addCallRecord(imei, phone, type, duration = null) {
-    if (!AppState.callRecords[imei]) {
-        AppState.callRecords[imei] = [];
+function addCallRecord(simKey, phone, type, duration = null) {
+    if (!AppState.callRecords[simKey]) {
+        AppState.callRecords[simKey] = [];
     }
     
-    AppState.callRecords[imei].push({
+    AppState.callRecords[simKey].push({
         id: `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
         time: new Date().toISOString(),
         phone,
@@ -1337,17 +1419,17 @@ function addCallRecord(imei, phone, type, duration = null) {
 
 // 处理来电事件
 function handleCallEvent(data) {
-    const imei = data.device_id || AppState.selectedDevice;
+    const simKey = data.device_id || AppState.selectedDevice;
     
     if (data.event === 'call_incoming') {
-        addCallRecord(imei, data.phone || data.from, 'incoming');
+        addCallRecord(simKey, data.phone || data.from, 'incoming');
         showToast(`来电: ${formatPhoneDisplay(data.phone || data.from)}`, 'warning');
     } else if (data.event === 'call_disconnected') {
-        addCallRecord(imei, data.phone, 'outgoing', data.duration);
+        addCallRecord(simKey, data.phone, 'outgoing', data.duration);
     }
     
-    if (AppState.selectedDevice === imei) {
-        refreshCallData(imei);
+    if (AppState.selectedDevice === simKey) {
+        refreshCallData(simKey);
     }
 }
 

@@ -25,10 +25,10 @@ def utc_timestamp() -> str:
     return datetime.now(UTC_TZ).isoformat(timespec="seconds")
 
 
-# ==================== 号码标准化 / 展示格式化 ====================
-# 目的: 解决同一号码因是否带国家码(如 +86)被识别为两个联系人的问题。
-#   - normalize_phone(): 生成会话聚合用的规范匹配键(剥离国家码与分隔符)
-#   - format_phone_display(): 界面展示用, 中国大陆手机号统一格式化为 +86 前缀
+# ==================== 号码标准化 ====================
+# 后端仅保留 normalize_phone(), 用于 purge 时按归一化键匹配同一联系人的多种原始号码形态。
+# 注意: 入库存储一律原样保留 peer_phone(含原始国家码, 不做剥离), 数据完整性由后端保证;
+#       号码的会话聚合与展示格式化(国家码剥离/补全)已移至前端实现。
 
 def normalize_phone(raw) -> str:
     """将号码标准化为会话聚合匹配用的规范形式。
@@ -63,17 +63,6 @@ def normalize_phone(raw) -> str:
             # 无前缀但形如 86 + 11位手机号 -> 剥离国家码
             digits = rest
     return digits
-
-
-def format_phone_display(raw) -> str:
-    """界面展示用: 中国大陆手机号统一格式化为带国家码的 +86 标准形式。
-
-    非中国大陆手机号(短号/服务号/国际号等)保持规范数字形式, 不强加 +86。
-    """
-    key = normalize_phone(raw)
-    if key and key.isdigit() and len(key) == 11 and key.startswith("1"):
-        return "+86" + key
-    return key
 
 
 SCHEMA = """
@@ -196,30 +185,6 @@ def _migrate_legacy_to_device_id(conn):
     conn.commit()
 
 
-def _normalize_existing_peer_phones(conn):
-    """将 sms_messages / call_records 中历史 peer_phone 归一化为规范匹配键。
-
-    使同一号码(无论是否带 +86)的历史记录合并到同一会话线程。幂等:
-    已是规范形式的记录不会被改动。
-    """
-    changed = 0
-    for table in ("sms_messages", "call_records"):
-        if not _table_exists(conn, table):
-            continue
-        rows = conn.execute(f"SELECT DISTINCT peer_phone FROM {table}").fetchall()
-        for r in rows:
-            raw = r[0]
-            norm = normalize_phone(raw)
-            if norm != raw:
-                conn.execute(
-                    f"UPDATE {table} SET peer_phone=? WHERE peer_phone=?", (norm, raw)
-                )
-                changed += 1
-    if changed:
-        conn.commit()
-        logger.warning("号码归一化迁移完成: 合并了 %d 组历史号码差异", changed)
-
-
 class Database:
     """OmniSMS SQLite 数据库封装 (线程安全)"""
 
@@ -246,8 +211,6 @@ class Database:
                 # 兼容旧库: 若 devices 表缺少 series/model 列则补齐(幂等)
                 _ensure_device_columns(conn, ("series", "model"))
                 conn.commit()
-                # 历史号码归一化: 合并因是否带国家码而分裂的会话(幂等, 已规范则无操作)
-                _normalize_existing_peer_phones(conn)
             finally:
                 conn.close()
 
@@ -377,7 +340,7 @@ class Database:
     def add_sms(self, device_id: str, peer_phone: str, text: str, direction: str,
                 status: str = "pending", task_id: Optional[str] = None,
                 timestamp: Optional[str] = None) -> int:
-        peer_phone = normalize_phone(peer_phone)  # 统一聚合键, 避免国家码差异分裂会话
+        # 原样存储对方号码, 不做归一化/剥离国家码, 保证后端数据完整性
         now = utc_timestamp()
         ts = timestamp or now
         with self._lock:
@@ -405,37 +368,36 @@ class Database:
             finally:
                 conn.close()
 
-    def get_sms_conversations(self, device_id: str) -> List[Dict]:
-        """获取某设备的短信会话列表 (按号码分组, 含最近消息)"""
+    def get_sms_all(self, device_id: str) -> List[Dict]:
+        """获取某设备的全部短信记录 (扁平, 原样返回 peer_phone, 不做聚合/格式化)。
+
+        号码的聚合(按归一化键分组)与展示格式化(国家码剥离/补全)交由前端完成,
+        后端仅负责持久化原始数据, 保证数据完整性。
+        """
         with self._lock:
             conn = self._get_conn()
             try:
                 rows = conn.execute(
-                    """SELECT peer_phone, MAX(timestamp) AS last_time, COUNT(*) AS count
-                       FROM sms_messages WHERE device_id=? GROUP BY peer_phone ORDER BY last_time DESC""",
+                    "SELECT id, peer_phone, text, direction, status, timestamp FROM sms_messages WHERE device_id=? ORDER BY id ASC",
                     (device_id,)
                 ).fetchall()
                 result = []
+                dir_map = {"out": "sent", "in": "received"}
                 for r in rows:
-                    last = conn.execute(
-                        "SELECT text, direction FROM sms_messages WHERE device_id=? AND peer_phone=? ORDER BY id DESC LIMIT 1",
-                        (device_id, r["peer_phone"])
-                    ).fetchone()
                     result.append({
+                        "id": r["id"],
                         "peer_phone": r["peer_phone"],
-                        "display_phone": format_phone_display(r["peer_phone"]),
-                        "last_time": r["last_time"],
-                        "count": r["count"],
-                        "last_message": last["text"] if last else "",
-                        "last_direction": last["direction"] if last else "in",
+                        "text": r["text"],
+                        "direction": dir_map.get(r["direction"], r["direction"]),
+                        "status": r["status"],
+                        "time": r["timestamp"],
                     })
                 return result
             finally:
                 conn.close()
 
     def get_sms_messages(self, device_id: str, peer_phone: str) -> List[Dict]:
-        """获取某会话的全部消息 (按时间升序)"""
-        peer_phone = normalize_phone(peer_phone)  # 兼容前端传入带/不带国家码的号码
+        """获取某会话的全部消息 (按时间升序, 按原始 peer_phone 精确匹配)。"""
         with self._lock:
             conn = self._get_conn()
             try:
@@ -449,7 +411,6 @@ class Database:
                     result.append({
                         "id": r["id"],
                         "peer_phone": r["peer_phone"],
-                        "display_phone": format_phone_display(r["peer_phone"]),
                         "text": r["text"],
                         "direction": dir_map.get(r["direction"], r["direction"]),
                         "status": r["status"],
@@ -459,11 +420,126 @@ class Database:
             finally:
                 conn.close()
 
+    def purge_sms_by_phone(self, device_id: Optional[str], phone: str,
+                           confirm: bool = False, dry_run: bool = False) -> Dict:
+        """彻底清空与指定号码相关的所有短信记录 (事务 + 二次验证 + 回滚)。
+
+        完整性保障:
+          1. 后端按原始 peer_phone 存储(不剥离国家码); 此处按 normalize_phone 归一化键匹配,
+             以兼容同一联系人的多种原始号码形态(如 +8610010 与 10010)一并清空;
+          2. 在全局锁内的单连接事务中执行: 收集匹配行 -> 删除 -> 二次扫描验证;
+          3. 校验删除行数 == 删除前计数 且 删除后计数为 0; 任一不满足则 ROLLBACK;
+          4. 任何异常均 ROLLBACK 并返回明确失败状态, 杜绝部分删除/残留的不确定性。
+
+        参数:
+          device_id: 设备标识; 为 None/空 时跨所有设备清空该号码。
+          phone:     目标号码 (支持带/不带 +86 及分隔符)。
+          confirm:   必须为 True 才执行实际删除; 否则仅返回待删计数并提示需确认。
+          dry_run:   为 True 时只统计不删除 (与 confirm 互斥, 优先)。
+
+        返回: 含 success / status / message / before_count / after_count / deleted_count 的状态字典。
+        """
+        norm_phone = normalize_phone(phone)
+        result: Dict = {
+            "success": False,
+            "status": "ERROR",
+            "device_id": device_id,
+            "phone": phone,
+            "normalized_phone": norm_phone,
+            "before_count": 0,
+            "after_count": -1,
+            "deleted_count": 0,
+            "message": "",
+        }
+        if not norm_phone:
+            result["status"] = "INVALID_PARAM"
+            result["message"] = "phone 不能为空或无法解析"
+            return result
+
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                # 1) 收集匹配行: 按归一化键匹配, 兼容同一联系人的多种原始号码形态
+                if device_id:
+                    rows = conn.execute(
+                        "SELECT id, peer_phone FROM sms_messages WHERE device_id=?", (device_id,)
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT id, peer_phone FROM sms_messages"
+                    ).fetchall()
+                target_ids = [r["id"] for r in rows
+                              if normalize_phone(r["peer_phone"]) == norm_phone]
+                before = len(target_ids)
+                result["before_count"] = before
+
+                if before == 0:
+                    result["success"] = True
+                    result["status"] = "NO_RECORDS"
+                    result["message"] = "目标号码无短信记录, 无需删除"
+                    conn.commit()
+                    return result
+
+                # 2) 确认 / 预演机制: 未确认或 dry_run 不执行实际删除
+                if dry_run or not confirm:
+                    result["success"] = dry_run
+                    result["status"] = "DRY_RUN" if dry_run else "NEEDS_CONFIRMATION"
+                    result["message"] = (
+                        f"将删除 {before} 条记录"
+                        + (" (dry_run, 未实际执行)" if dry_run else " (需 confirm=True 才会执行)")
+                    )
+                    conn.rollback()
+                    return result
+
+                # 3) 事务中执行删除 (按主键精确删除匹配行)
+                placeholders = ",".join("?" * len(target_ids))
+                cur = conn.execute(
+                    f"DELETE FROM sms_messages WHERE id IN ({placeholders})", target_ids
+                )
+                deleted = cur.rowcount
+                result["deleted_count"] = deleted
+
+                # 4) 二次扫描验证: 确认无归一化键匹配的残留行
+                if device_id:
+                    recheck = conn.execute(
+                        "SELECT peer_phone FROM sms_messages WHERE device_id=?", (device_id,)
+                    ).fetchall()
+                else:
+                    recheck = conn.execute("SELECT peer_phone FROM sms_messages").fetchall()
+                after = sum(1 for r in recheck
+                            if normalize_phone(r["peer_phone"]) == norm_phone)
+                result["after_count"] = after
+
+                if after == 0 and deleted == before:
+                    conn.commit()
+                    result["success"] = True
+                    result["status"] = "SUCCESS"
+                    result["message"] = f"已彻底清空 {deleted} 条短信记录, 二次验证通过"
+                else:
+                    conn.rollback()
+                    result["success"] = False
+                    result["status"] = "FAILED_VERIFICATION"
+                    result["message"] = (
+                        f"删除不完整: 删除前={before}, 实际删除={deleted}, 残留={after}, 已回滚"
+                    )
+                return result
+            except Exception as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                result["status"] = "ERROR"
+                result["message"] = f"删除过程异常, 已回滚: {e}"
+                logger.exception("purge_sms_by_phone 执行异常")
+                return result
+            finally:
+                conn.close()
+
     # ==================== 通话 ====================
 
     def add_call(self, device_id: str, peer_phone: str, direction: str,
                  status: str = "unknown", start_time: Optional[str] = None) -> int:
-        peer_phone = normalize_phone(peer_phone)  # 统一聚合键, 避免国家码差异分裂会话
+        # 原样存储对方号码, 不做归一化/剥离国家码, 保证后端数据完整性
         now = utc_timestamp()
         st = start_time or now
         with self._lock:
@@ -499,6 +575,10 @@ class Database:
                 conn.close()
 
     def get_calls(self, device_id: str) -> List[Dict]:
+        """获取某设备的全部通话记录 (扁平, 原样返回 peer_phone, 不做聚合/格式化)。
+
+        号码的聚合(按归一化键分组)与展示格式化交由前端完成。
+        """
         with self._lock:
             conn = self._get_conn()
             try:
@@ -512,46 +592,12 @@ class Database:
                     result.append({
                         "id": r["id"],
                         "peer_phone": r["peer_phone"],
-                        "display_phone": format_phone_display(r["peer_phone"]),
                         "type": dir_map.get(r["direction"], r["direction"]),
                         "status": r["status"],
                         "time": r["start_time"],
                         "start_time": r["start_time"],
                         "end_time": r["end_time"],
                         "duration": r["duration"] or 0,
-                    })
-                return result
-            finally:
-                conn.close()
-
-    def get_call_conversations(self, device_id: str) -> List[Dict]:
-        """获取通话会话列表 (按号码分组, 含最近通话), 按最近时间倒序"""
-        with self._lock:
-            conn = self._get_conn()
-            try:
-                rows = conn.execute(
-                    """SELECT peer_phone, MAX(start_time) AS last_time, COUNT(*) AS count
-                       FROM call_records WHERE device_id=? GROUP BY peer_phone ORDER BY last_time DESC""",
-                    (device_id,)
-                ).fetchall()
-                result = []
-                dir_map = {"in": "incoming", "out": "outgoing"}
-                for r in rows:
-                    last = conn.execute(
-                        "SELECT id, direction, status, start_time, duration FROM call_records WHERE device_id=? AND peer_phone=? ORDER BY id DESC LIMIT 1",
-                        (device_id, r["peer_phone"])
-                    ).fetchone()
-                    last_type = dir_map.get(last["direction"], last["direction"]) if last else "incoming"
-                    last_status = last["status"] if last else ""
-                    last_duration = last["duration"] or 0
-                    result.append({
-                        "peer_phone": r["peer_phone"],
-                        "display_phone": format_phone_display(r["peer_phone"]),
-                        "last_time": r["last_time"],
-                        "count": r["count"],
-                        "last_type": last_type,
-                        "last_status": last_status,
-                        "last_duration": last_duration,
                     })
                 return result
             finally:

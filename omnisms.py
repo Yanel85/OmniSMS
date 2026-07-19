@@ -209,6 +209,7 @@ class DeviceInfo:
     phone: str = ""         # 本机号码(MSISDN), 业务主键; 缺失时回退 imsi(卡的标识), 再回退 imei
     imei: str = ""
     iccid: str = ""
+    no_card: bool = False   # 无卡状态: 既无本机号码也无 IMSI(此时 device_id 回退到 IMEI), 短信/通话不可用
     at_port: str = ""        # 运行时动态分配的业务端口(VUART_0)，不固定为某个 ttyACM 编号
     log_port: str = ""       # 调试日志端口(DBG)，ttyACM 编号由系统动态分配
     physical_path: str = ""  # USB 物理设备路径，例如 1-1.2
@@ -837,19 +838,25 @@ class OmniSMSEngine:
     
     def _register_device(self, imei: str, iccid: str, imsi: str, phone: str, ser: serial.Serial,
                          port: str, physical_path: str = "", paired_ports=None, model: str = ""):
-        """注册新设备并启动 AT 端口读取线程。device_id = 本机号码 或 回退 IMSI(卡的标识) 或 IMEI。"""
+        """注册新设备并启动 AT 端口读取线程。device_id = 本机号码 或 回退 IMSI(卡的标识) 或 IMEI。
+
+        无卡状态判定: 既无本机号码也无 IMSI 时, 设备可连接但视为无卡(device_id 回退 IMEI),
+        短信与通话功能不可用。
+        """
         now = utc_timestamp()
         paired_ports = set(paired_ports or {port})
         log_ports = sorted(paired_ports - {port})
         device_id = phone or imsi or imei
         # 系列识别: 由固件上报 model 或 IMEI TAC 推断, 用于前端标注(业务零分支)
         series = classify_series(model, imei)
+        no_card = not (phone or imsi)
 
         device = DeviceInfo(
             phone=phone,
             imei=imei,
             iccid=iccid,
             imsi=imsi,
+            no_card=no_card,
             at_port=port,
             log_port=log_ports[0] if log_ports else "",
             physical_path=physical_path or self._usb_physical_path(port) or "",
@@ -1095,6 +1102,8 @@ class OmniSMSEngine:
                 value = msg.get(field_name)
                 if isinstance(value, (int, float)):
                     setattr(device, field_name, int(value))
+            # 号码/IMSI 到位后重算无卡状态(此前可能以 IMEI 兜底注册为无卡)
+            device.no_card = not (device.phone or device.imsi)
             # 本机号码到位而此前以 IMEI 兜底注册 -> 迁移设备标识到号码
             new_dev_id = device_id_of(device)
             if new_dev_id != dev_id:
