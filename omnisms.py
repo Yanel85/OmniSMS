@@ -8,8 +8,8 @@ OmniSMS Linux 主机守护进程
 import json
 import logging
 import os
+import queue
 import re
-import signal
 import sys
 import threading
 import time
@@ -32,7 +32,6 @@ class Config:
     SCAN_INTERVAL_SEC: float = 3.0          # 端口扫描间隔(秒)
     SERIAL_TIMEOUT: float = 1.0             # 串口读取超时(秒)
     BOOT_TIMEOUT: float = 5.0               # 启动事件等待超时(秒)
-    BOOT_RETRY_TIMEOUT: float = 10.0        # 历史保留字段(单端口探测不再额外追加该时长)
     IDENTIFY_INTERVAL_SEC: float = 3.0      # 探测期间重复发送 identify 的间隔(秒)
     MANUAL_PROBE_TIMEOUT: float = 15.0      # 手动扫描: 每个端口独立等待固件事件的超时(秒)
     RESCAN_KNOWN_GROUP_SEC: float = 60.0    # 已确定但注册失败的设备组, 降低频率重新探测的间隔(秒)
@@ -60,6 +59,9 @@ class Config:
     PORT_PATTERN: str = r"/dev/ttyACM\d+"
     # 兼容的 USB VID/PID 列表(默认含 19d1:0001; 如需支持更多变体在此追加 (vid, pid) 元组)
     LUAT_VID_PID_LIST: list = field(default_factory=lambda: [(0x19D1, 0x0001)])
+
+    # 是否禁用 pySerial 直连 (Docker 环境设为 True, 仅使用 WebSerial 桥接)
+    DISABLE_PYSERIAL: bool = False
 
 
 # ==================== Air780 设备家族(系列)定义 ====================
@@ -248,8 +250,92 @@ class DeviceInfo:
     bands: Optional[str] = None  # 当前工作频段列表(JSON 字符串)
     series: str = ""             # 设备系列(由 model/IMEI TAC 推断, 如 Air780EG)
     model: str = ""              # 设备型号(固件上报, 如 Air780EG)
-    serial_obj: Optional[serial.Serial] = None  # 串口对象
+    remark: str = ""             # 用户备注(持久化于数据库, 内存同步)
+    serial_obj: Optional[object] = None  # 串口对象 (pyserial.Serial 或 WebSerialVirtualPort)
     write_lock: threading.Lock = field(default_factory=threading.Lock)  # 写入锁
+    # ===== WebSerial 备份支持 =====
+    connection_type: str = "pyserial"  # "pyserial" | "webserial"
+    bridge_id: str = ""               # WebSerialBridge 实例 ID (webserial 模式)
+
+
+class WebSerialVirtualPort:
+    """模拟 pyserial.Serial 接口的 WebSerial 适配器。
+
+    使现有 _send_command() 和 _reader_loop() 无需修改即可工作于 WebSerial 模式。
+    实现 serial.Serial 的最小接口子集:
+      - is_open: bool
+      - write(data: bytes) -> int
+      - flush()
+      - close()
+    以及内部数据喂入接口:
+      - feed_data(raw_line: str): 由 WebSerialBridge 调用, 将浏览器上报的数据喂入读取队列
+    """
+
+    def __init__(self, bridge=None):
+        self.bridge = bridge
+        self._is_open = True
+        self._write_lock = threading.Lock()
+        self._read_queue = queue.Queue(maxsize=1000)
+        self._write_queue: list = []  # 待写入的数据列表, 由桥接层异步消费
+
+    @property
+    def is_open(self) -> bool:
+        return self._is_open and (self.bridge is None or getattr(self.bridge, 'is_connected', True))
+
+    def write(self, data: bytes) -> int:
+        """写入数据 -> 放入写队列, 由 WebSerialBridge 通过 WebSocket 下发给浏览器 -> WebSerial API 写入 USB"""
+        with self._write_lock:
+            cmd_str = data.decode('utf-8', errors='ignore').strip()
+            if cmd_str:
+                try:
+                    cmd_json = json.loads(cmd_str)
+                    self._write_queue.append(cmd_json)
+                except json.JSONDecodeError:
+                    self._write_queue.append({"_raw": cmd_str})
+            return len(data)
+
+    def flush(self):
+        """WebSerial 模式下 flush 为空操作(数据已入队, 由桥接层异步推送)"""
+        pass
+
+    def readline(self, timeout: float = 1.0) -> bytes:
+        """读取一行数据 <- 浏览器从 USB 读取后通过 WebSocket 上报 -> Bridge.feed_data()"""
+        try:
+            line = self._read_queue.get(timeout=timeout)
+            return (line + '\n').encode('utf-8') if isinstance(line, str) else line
+        except queue.Empty:
+            return b''
+
+    def close(self):
+        self._is_open = False
+        # 清空队列以解除可能阻塞的读操作
+        while not self._read_queue.empty():
+            try:
+                self._read_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def feed_data(self, raw_line: str):
+        """由 WebSerialBridge 调用: 将浏览器上报的原始数据行喂入读取队列"""
+        if not self._is_open:
+            return
+        try:
+            # 队列满时丢弃最旧的数据, 避免阻塞
+            if self._read_queue.full():
+                try:
+                    self._read_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            self._read_queue.put_nowait(raw_line)
+        except Exception:
+            pass
+
+    def dequeue_command(self) -> Optional[dict]:
+        """由 WebSerialBridge 调用: 取出待发送的命令"""
+        with self._write_lock:
+            if self._write_queue:
+                return self._write_queue.pop(0)
+            return None
 
 
 def device_id_of(device: "DeviceInfo") -> str:
@@ -299,7 +385,7 @@ class OmniSMSEngine:
     @staticmethod
     def _port_index(port: str) -> Optional[int]:
         """获取 ttyACM 数字偏移，用于区分同一模组的接口端口。"""
-        match = re.search(r"ttyACM(\\d+)$", os.path.basename(port))
+        match = re.search(r"ttyACM(\d+)$", os.path.basename(port))
         return int(match.group(1)) if match else None
 
     def __init__(self, config: Config):
@@ -350,8 +436,8 @@ class OmniSMSEngine:
         # 业务事件回调 (供 web.py 推送到 WebSocket)
         self.event_callback: Optional[Callable] = None
         
-        # 进行中的通话记录 {device_id: call_id}
-        self.active_calls: Dict[str, int] = {}
+        # 进行中的通话记录 {device_id: (call_id, start_time, direction)}
+        self.active_calls: Dict[str, tuple] = {}
         
         logger.info("OmniSMS Engine initialized")
     
@@ -360,13 +446,19 @@ class OmniSMSEngine:
         logger.info("=" * 60)
         logger.info("OmniSMS Daemon Starting...")
         logger.info(f"Config: baud={self.config.BAUD_RATE}")
+        if self.config.DISABLE_PYSERIAL:
+            logger.info("Config: pySerial DISABLED (WebSerial bridge only)")
         logger.info("=" * 60)
 
         self.running = True
-        self.start_auto_scan()
+        if not self.config.DISABLE_PYSERIAL:
+            self.start_auto_scan()
         self.start_watchdog()
 
-        logger.info("OmniSMS Engine started successfully (auto scan enabled)")
+        if self.config.DISABLE_PYSERIAL:
+            logger.info("OmniSMS Engine started (pySerial disabled, WebSerial bridge only)")
+        else:
+            logger.info("OmniSMS Engine started successfully (auto scan enabled)")
 
     def stop(self):
         """停止引擎"""
@@ -416,6 +508,10 @@ class OmniSMSEngine:
         per_port_timeout 秒(可被"停止扫描"提前中断)。
         返回 True 表示已启动, False 表示已有扫描在进行中。
         """
+        if self.config.DISABLE_PYSERIAL:
+            logger.info("Manual scan rejected: pySerial is disabled (WebSerial bridge only)")
+            return False
+
         with self.state_lock:
             if self.scanning:
                 logger.info("Manual scan already in progress; ignoring new request")
@@ -458,6 +554,10 @@ class OmniSMSEngine:
         AUTO_SCAN_STOP_AFTER_DEVICE_SEC 秒后自动停止。
         已运行时返回 False。不影响已注册设备。
         """
+        if self.config.DISABLE_PYSERIAL:
+            logger.info("Auto scan rejected: pySerial is disabled (WebSerial bridge only)")
+            return False
+
         with self.state_lock:
             if self.auto_scanning or self.scanning:
                 logger.info("A scan is already in progress; ignoring auto scan")
@@ -775,10 +875,6 @@ class OmniSMSEngine:
             ser.close()
             return
 
-            # 3) 非固件事件(Lua REPL 报错 / AT 回显等): 不是目标口
-            logger.debug(f"{port} returned non-firmware data (event={event}); skipping")
-            ser.close()
-
         except serial.SerialException as e:
             logger.error(f"Cannot open port {port}: {e}")
         except Exception as e:
@@ -837,36 +933,6 @@ class OmniSMSEngine:
 
         return None
 
-    def _wait_for_boot_event(self, ser: serial.Serial, timeout: float,
-                             stop_event: Optional[threading.Event] = None) -> Optional[dict]:
-        """等待设备发送 boot 事件(含 imei/iccid)。
-        若提供 stop_event 且被置位, 则提前返回 None(用于响应"停止扫描")。"""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            if stop_event is not None and stop_event.is_set():
-                logger.debug(f"{ser.name} boot-event wait interrupted by stop signal")
-                return None
-            try:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                if not line:
-                    time.sleep(0.1)
-                    continue
-
-                logger.debug(f"Raw data during discovery: {line[:80]}")
-
-                try:
-                    msg = json.loads(line)
-                    if isinstance(msg, dict) and msg.get("event") == "boot":
-                        return msg
-                except json.JSONDecodeError:
-                    continue
-
-            except serial.SerialException as e:
-                logger.error(f"Serial error during boot wait: {e}")
-                break
-
-        return None
-    
     def _register_device(self, imei: str, iccid: str, imsi: str, phone: str, ser: serial.Serial,
                          port: str, physical_path: str = "", paired_ports=None, model: str = ""):
         """注册新设备并启动 AT 端口读取线程。device_id = 本机号码 或 回退 IMSI(卡的标识) 或 IMEI。
@@ -973,8 +1039,16 @@ class OmniSMSEngine:
             self.db.update_device_status(device_id, "offline")
         
         with self.state_lock:
-            if device_id in self.devices:
-                self.devices[device_id].status = "offline"
+            device = self.devices.get(device_id)
+            if device:
+                device.status = "offline"
+                # 关闭串口句柄, 释放资源 (reader 线程随后因 is_open=False 退出)
+                if device.serial_obj is not None:
+                    try:
+                        device.serial_obj.close()
+                    except Exception as e:
+                        logger.debug(f"Error closing serial on disconnect: {e}")
+                    device.serial_obj = None
             
             if port in self.port_to_device:
                 del self.port_to_device[port]
@@ -1075,9 +1149,169 @@ class OmniSMSEngine:
             for port in list(getattr(device, "paired_ports", set()) or set()):
                 self.port_to_device.pop(port, None)
                 self.reader_threads.pop(port, None)
+            # 清理 WebSerial 桥接端口映射与读取线程 (若有)
+            if getattr(device, "connection_type", "pyserial") == "webserial":
+                ws_port = f"webserial://{device.bridge_id}"
+                self.port_to_device.pop(ws_port, None)
+                self.reader_threads.pop(ws_port, None)
             self.devices.pop(device_id, None)
 
             logger.info(f"✗ Device removed from engine: ID={device_id}")
+
+    # ==================== WebSerial 桥接支持 ====================
+
+    def register_webserial_device(self, bridge_id: str, boot_data: dict) -> Optional[str]:
+        """通过 WebSerial 桥接注册设备。
+
+        由 WebSerialBridge 在收到 boot/keepalive 事件时调用。
+        创建 WebSerialVirtualPort 并注册到引擎。
+
+        Args:
+            bridge_id: WebSerial 桥接实例 ID
+            boot_data: 从原始 JSON 解析的 boot/keepalive 事件数据
+
+        Returns:
+            注册成功返回 device_id, 失败返回 None
+        """
+        imei = boot_data.get("imei", "")
+        if len(imei) < 15:
+            logger.warning(f"WebSerial: invalid IMEI in boot data: {imei}")
+            return None
+
+        # 确定 device_id (优先使用 number, 其次 imsi, 最后 imei)
+        device_id = boot_data.get("number") or boot_data.get("imsi") or imei
+
+        # 检查是否已存在同 IMEI 设备 (get_device 支持按 imei 精确查找)
+        existing = self.get_device(imei)
+        if existing and existing.connection_type == "webserial":
+            # 已存在的 WebSerial 设备, 更新即可
+            logger.info(f"WebSerial: updating existing device {device_id}")
+            self._update_webserial_device(existing, boot_data)
+            return device_id_of(existing)
+        elif existing:
+            # 存在 pyserial 设备, 不覆盖 (pyserial 优先)
+            logger.info(f"WebSerial: pyserial device already exists for IMEI {imei}, skipping")
+            return None
+
+        # 创建虚拟端口
+        virtual_port = WebSerialVirtualPort()
+
+        # 构造 DeviceInfo
+        now = utc_timestamp()
+        device = DeviceInfo(
+            phone=boot_data.get("number") or "",
+            imei=imei,
+            iccid=boot_data.get("iccid", ""),
+            no_card=(not boot_data.get("number") and not boot_data.get("imsi")),
+            at_port=f"webserial://{bridge_id}",
+            log_port="",
+            physical_path="",
+            paired_ports=set(),
+            status="online",
+            last_seen=now,
+            last_heartbeat=now,
+            missed_heartbeats=0,
+            rssi=boot_data.get("rssi"),
+            rsrp=boot_data.get("rsrp"),
+            rsrq=boot_data.get("rsrq"),
+            snr=boot_data.get("snr"),
+            net_status=boot_data.get("netStatus"),
+            imsi=boot_data.get("imsi"),
+            csq=boot_data.get("csq"),
+            bands=json.dumps(boot_data.get("bands", [])) if boot_data.get("bands") else None,
+            series=classify_series(boot_data.get("model", ""), imei),
+            model=boot_data.get("model", ""),
+            serial_obj=virtual_port,
+            connection_type="webserial",
+            bridge_id=bridge_id,
+        )
+
+        # 注册到引擎
+        with self.state_lock:
+            self.devices[device_id] = device
+            self.port_to_device[f"webserial://{bridge_id}"] = device_id
+
+        # 启动读取线程 (复用 _reader_loop, 从 WebSerialVirtualPort 队列消费数据)
+        reader_thread = threading.Thread(
+            target=self._reader_loop,
+            args=(device,),
+            name=f"Reader-WebSerial-{bridge_id}",
+            daemon=True
+        )
+        reader_thread.start()
+        self.reader_threads[f"webserial://{bridge_id}"] = reader_thread
+
+        # 持久化
+        if self.db:
+            self.db.upsert_device(
+                device_id=device_id, phone=device.phone,
+                imei=device.imei, iccid=device.iccid,
+                at_port=device.at_port, status="online",
+                last_seen=device.last_seen, model=device.model,
+            )
+
+        # 通知前端
+        self._notify_event("device_online", device_id, {
+            "status": "online",
+            "port": device.at_port,
+            "connection_type": "webserial",
+            **{k: v for k, v in boot_data.items() if k in ("phone", "model", "rssi")}
+        })
+
+        logger.info(f"WebSerial device registered: {device_id} ({imei}) via bridge {bridge_id}")
+        return device_id
+
+    def _update_webserial_device(self, device: DeviceInfo, data: dict):
+        """更新已有的 WebSerial 设备信息"""
+        now = utc_timestamp()
+        device.status = "online"
+        device.last_seen = now
+        device.last_heartbeat = now
+        device.missed_heartbeats = 0
+
+        # 更新信号信息
+        for key in ("rssi", "rsrp", "rsrq", "snr", "csq"):
+            if key in data:
+                setattr(device, key, data[key])
+
+        # 更新数据库 (使用正确的 device_id)
+        if self.db:
+            self.db.update_device_status(device_id_of(device), "online")
+
+    def unregister_webserial_device(self, bridge_id: str) -> Optional[str]:
+        """移除 WebSerial 桥接设备 (桥接断开时调用)"""
+        port_key = f"webserial://{bridge_id}"
+        with self.state_lock:
+            device_id = self.port_to_device.get(port_key)
+            if device_id:
+                device = self.devices.get(device_id)
+                if device and device.connection_type == "webserial":
+                    self.remove_device(device_id)
+                    return device_id
+        return None
+
+    def feed_webserial_data(self, bridge_id: str, raw_line: str):
+        """由 WebSerialBridge 调用: 将浏览器上报的原始数据行喂入对应设备的虚拟端口"""
+        port_key = f"webserial://{bridge_id}"
+        with self.state_lock:
+            device_id = self.port_to_device.get(port_key)
+            if not device_id:
+                return
+            device = self.devices.get(device_id)
+            if device and device.serial_obj and isinstance(device.serial_obj, WebSerialVirtualPort):
+                device.serial_obj.feed_data(raw_line)
+
+    def get_webserial_command(self, bridge_id: str) -> Optional[dict]:
+        """由 WebSerialBridge 调用: 取出待发送到设备的命令"""
+        port_key = f"webserial://{bridge_id}"
+        with self.state_lock:
+            device_id = self.port_to_device.get(port_key)
+            if not device_id:
+                return None
+            device = self.devices.get(device_id)
+            if device and device.serial_obj and isinstance(device.serial_obj, WebSerialVirtualPort):
+                return device.serial_obj.dequeue_command()
+        return None
 
     # ==================== 串口读取循环 ====================
     
@@ -1273,8 +1507,8 @@ class OmniSMSEngine:
             })
             
             # 从待发队列移除
-            if task_id in self.pending_tasks:
-                del self.pending_tasks[task_id]
+            with self.state_lock:
+                self.pending_tasks.pop(task_id, None)
             
         elif event_type == "call_incoming":
             # 来电通知
@@ -1282,7 +1516,7 @@ class OmniSMSEngine:
             logger.info(f"Incoming Call from {phone}")
             if self.db:
                 call_id = self.db.add_call(dev_id, phone, "in", "ringing")
-                self.active_calls[dev_id] = call_id
+                self.active_calls[dev_id] = (call_id, time.time(), "in")
             self._notify_event("call_incoming", dev_id, {"phone": phone})
             
         elif event_type == "call_disconnected":
@@ -1291,13 +1525,17 @@ class OmniSMSEngine:
             phone = msg.get("phone", "unknown")
             logger.info(f"Call Disconnected: reason={reason}")
             
-            call_id = self.active_calls.get(dev_id)
+            call_info = self.active_calls.get(dev_id)
             now = utc_timestamp()
-            if self.db and call_id:
-                self.db.update_call(call_id, status="disconnected", end_time=now, duration=0)
+            direction = "in"
+            duration = 0
+            if self.db and call_info:
+                call_id, start_time, direction = call_info
+                duration = max(0, int(time.time() - start_time)) if start_time else 0
+                self.db.update_call(call_id, status="disconnected", end_time=now, duration=duration)
                 self.active_calls.pop(dev_id, None)
             self._notify_event("call_disconnected", dev_id, {
-                "phone": phone, "reason": reason
+                "phone": phone, "reason": reason, "direction": direction, "duration": duration
             })
             
         else:
@@ -1313,10 +1551,10 @@ class OmniSMSEngine:
     
     # ==================== 下行命令接口 ====================
     
-    def send_sms(self, device_id: str, phone: str, text: str) -> str:
+    def send_sms(self, device_id: str, phone: str, text: str) -> Optional[str]:
         """
         发送短信命令
-        @return: 任务ID
+        @return: 任务ID; 发送失败时返回 None
         """
         import uuid
         
@@ -1331,21 +1569,23 @@ class OmniSMSEngine:
         
         success = self._send_command(device_id, command)
         
-        if success:
-            # 记录待确认任务
+        if not success:
+            logger.error(f"Failed to send SMS command to {device_id}")
+            return None
+        
+        # 记录待确认任务
+        with self.state_lock:
             self.pending_tasks[task_id] = SMSTask(
                 task_id=task_id,
                 phone=phone,
                 text=text,
                 timestamp=utc_timestamp()
             )
-            # 持久化发送记录
-            if self.db:
-                self.db.add_sms(device_id, phone, text, "out", "pending", task_id,
-                                utc_timestamp())
-            logger.info(f"SMS send command dispatched: task={task_id}, to={phone}")
-        else:
-            logger.error(f"Failed to send SMS command to {device_id}")
+        # 持久化发送记录
+        if self.db:
+            self.db.add_sms(device_id, phone, text, "out", "pending", task_id,
+                            utc_timestamp())
+        logger.info(f"SMS send command dispatched: task={task_id}, to={phone}")
         
         return task_id
     
@@ -1360,7 +1600,7 @@ class OmniSMSEngine:
         success = self._send_command(device_id, command)
         if success and self.db:
             call_id = self.db.add_call(device_id, phone, "out", "dialing")
-            self.active_calls[device_id] = call_id
+            self.active_calls[device_id] = (call_id, time.time(), "out")
         return success
     
     def hangup_call(self, device_id: str) -> bool:
@@ -1372,6 +1612,7 @@ class OmniSMSEngine:
     def _send_command(self, device_id: str, command: dict) -> bool:
         """
         发送下行命令到指定设备
+        支持两种连接类型: pyserial (直连) 和 webserial (浏览器桥接)
         使用线程安全写入
         """
         with self.state_lock:
@@ -1381,26 +1622,29 @@ class OmniSMSEngine:
                 logger.error(f"Device not found or offline: {device_id}")
                 return False
             
-            if not device.serial_obj.is_open:
-                logger.error(f"Serial port not open for {device_id}")
+            port_obj = device.serial_obj
+            
+            # 统一检查 is_open 属性 (pyserial 和 WebSerialVirtualPort 均支持)
+            if not getattr(port_obj, 'is_open', False):
+                logger.error(f"Port not open for {device_id} (type={device.connection_type})")
                 return False
             
             try:
                 # 加锁写入，确保原子性
                 with device.write_lock:
                     cmd_json = json.dumps(command, ensure_ascii=False) + "\n"
-                    written = device.serial_obj.write(cmd_json.encode('utf-8'))
-                    device.serial_obj.flush()
+                    written = port_obj.write(cmd_json.encode('utf-8'))
                     
-                    logger.debug(f"Sent to {device_id}: {cmd_json.strip()}")
+                    # 仅 pyserial 模式需要 flush (WebSerialVirtualPort.flush 为空操作)
+                    if device.connection_type == "pyserial" and hasattr(port_obj, 'flush'):
+                        port_obj.flush()
+                    
+                    logger.debug(f"Sent to {device_id} [{device.connection_type}]: {cmd_json.strip()}")
                     return written > 0
                     
-            except serial.SerialException as e:
-                logger.error(f"Serial write error to {device_id}: {e}")
-                device.status = "error"
-                return False
             except Exception as e:
-                logger.error(f"Error sending command to {device_id}: {e}")
+                logger.error(f"Error sending command to {device_id} [{device.connection_type}]: {e}")
+                device.status = "error"
                 return False
     
     # ==================== 状态查询接口 ====================
@@ -1420,16 +1664,5 @@ class OmniSMSEngine:
                 if d.imei == device_id or d.imsi == device_id:
                     return d
             return None
-
-
-# ==================== 信号处理与优雅退出 ====================
-
-def signal_handler(signum, frame):
-    """处理中断信号"""
-    logger.info(f"\nReceived signal {signum}, shutting down...")
-    global engine
-    if engine:
-        engine.stop()
-    sys.exit(0)
 
 

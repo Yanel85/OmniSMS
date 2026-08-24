@@ -1,8 +1,13 @@
 # OmniSMS
 
-基于 **FastAPI + LuatOS(Air780 家族)** 的多设备短信/通话管理系统，统一兼容 **Air780E / Air780EG / Air780EP / Air780EH**（系列识别规则与特性差异详见第十节）。
+基于 **FastAPI + LuatOS(Air780 家族)** 的多设备短信/通话管理系统，统一兼容 **Air780E / Air780EG / Air780EP / Air780EH**（系列识别规则与特性差异详见第十节）。当前版本 **v3.0.0**。
 
-一个进程同时承载 **Web 管理界面** 与 **设备守护引擎**：通过串口（真实 Air780E 模组）与设备通信，提供设备注册、短信收发、通话控制与实时日志能力。
+一个进程同时承载 **Web 管理界面** 与 **设备守护引擎**，提供设备注册、短信收发、通话控制与实时日志能力。支持两种设备接入方式：
+
+- **本地直连（pyserial）**：宿主进程通过 USB 串口（`/dev/ttyACM*`）直接与真实 Air780 模组通信。
+- **WebSerial 桥接**：浏览器 WebSerial API 经 `/ws/webserial` 将 USB 数据桥接到后端引擎（详见第六节）。
+
+两种接入方式**自由切换、二选一**；仅当检测到 **Docker 环境**时，自动禁用 pySerial，只能使用 WebSerial 桥接。
 
 ---
 
@@ -14,9 +19,10 @@ flowchart TB
 
     Browser -->|"REST API (HTTP)"| Web
     Browser -->|"WebSocket /ws/log"| Web
+    Browser -->|"WebSocket /ws/webserial (WebSerial 桥接)"| Web
 
     subgraph WebLayer["web.py — 唯一程序入口 (FastAPI + uvicorn)"]
-        Web["· REST 路由<br/>· 实时事件广播<br/>· 日志读取/推送<br/>· init_engine() 启动编排"]
+        Web["· REST 路由<br/>· 实时事件广播<br/>· 日志读取/推送<br/>· WebSerial 桥接<br/>· init_engine() 启动编排"]
     end
 
     Web -->|"import / 调用"| Engine
@@ -27,6 +33,7 @@ flowchart TB
 
     Engine -->|"serial (115200)"| Port[("串口 /dev/ttyACM*")]
     Port -->|"UART (JSON 行协议)"| Device
+    Browser -.->|"WebSerial API"| Device
     Device["Air780 家族模组<br/>(Air780E/EG/EP/EH)<br/>LuatOS 固件 (Luatos/*.lua)<br/>main / sms_handler / call_handler"]
 
     DB[("database.py<br/>SQLite: omnisms.db")]
@@ -48,8 +55,8 @@ flowchart TB
 
 ```
 OmniSMS/
-├── web.py              # 唯一入口：FastAPI Web 服务 + 启动编排（拉起引擎）
-├── omnisms.py          # 核心守护引擎 OmniSMSEngine（端口发现、消息路由、下行命令）
+├── web.py              # 唯一入口：FastAPI Web 服务 + 启动编排（拉起引擎）+ WebSerial 桥接
+├── omnisms.py          # 核心守护引擎 OmniSMSEngine（端口发现、消息路由、下行命令、WebSerial 虚拟端口）
 ├── database.py         # SQLite 持久化层（线程安全）
 ├── requirements.txt    # Python 依赖
 ├── omnisms.sh          # 管理脚本：虚拟环境/守护进程/源码更新
@@ -73,18 +80,21 @@ OmniSMS/
 ## 三、各模块职责
 
 ### 1. `web.py`（唯一程序入口）
-- 提供所有 REST API 与 `WebSocket /ws/log`。
-- `init_engine()`：构造 `Config` 与 `Database`，创建 `OmniSMSEngine` 并 `start()`。
+- 提供所有 REST API 与 `WebSocket /ws/log`、`/ws/webserial`。
+- `init_engine()`：构造 `Config` 与 `Database`，创建 `OmniSMSEngine` 并 `start()`；按 Docker 环境/环境变量决定是否禁用 pySerial。
 - `broadcast_engine_event()`：引擎业务事件回调，经 `asyncio.call_soon_threadsafe` 安全地推送到 WebSocket。
+- `WebSerialBridge`：管理浏览器 WebSerial 连接与后端引擎的桥接（注册/数据转发/命令下发）。
 - `WebLogHandler` + `LogFileReader`：将日志写入内存缓存、推送前端，并从 `logs/` 目录读取历史日志（按天轮转）。
-- 命令行参数：`--host`、`--port`。
+- 命令行参数：`--host`、`--port`、`--ssl-cert`、`--ssl-key`。
 
 ### 2. `omnisms.py`（守护引擎）
 - `OmniSMSEngine`：
   - `_auto_scan_worker` / `_discover_devices`：后台持续按 VID/PID 列表（默认 `19d1:0001`，覆盖 Air780E/EG/EP/EH）扫描真实 USB 串口；`start_auto_scan()` / `stop_auto_scan()` 控制启停。设备系列由 `classify_series()` 依据固件 `model` 或 IMEI TAC 推断，业务零分支。
   - `_try_register_device`：发送 `identify` 握手 → 等待 `boot` 事件（超时 5s）→ 注册设备并启动读取线程。
   - `_reader_loop` / `_handle_incoming_message`：按行解析 JSON，分发上行事件。
-  - 下行接口：`send_sms()`、`make_call()`、`hangup_call()`，经 `_send_command()` 线程安全写入串口。
+  - 下行接口：`send_sms()`（失败返回 `None`）、`make_call()`、`hangup_call()`，经 `_send_command()` 线程安全写入串口；同时支持 pyserial 直连与 WebSerial 虚拟端口两种连接类型。
+  - `WebSerialVirtualPort`：WebSerial 桥接模式下模拟串口对象，供引擎读取线程复用同一套消息处理逻辑。
+  - 通话状态：`active_calls` 记录 `(call_id, start_time, direction)`，挂断时计算真实通话时长并回传方向。
 - `event_callback`：供 Web 层推送实时事件到前端。
 
 ### 3. `database.py`（持久化）
@@ -113,7 +123,7 @@ OmniSMS/
 | `sms_received` | 设备→主机 | `phone`, `text`, `time`, `metas` | 收到新短信（`metas` 仅长短信含 `refNum`/`maxNum`/`seqNum` 分片信息） |
 | `sms_sent_result` | 设备→主机 | `id`, `status`(`accepted`/`fail`), `error_code`, `reason`, `api_ok`, `api_return`, `long_sms`, `net_status`, `rssi`, `iccid` | 短信发送结果（`accepted` 表示已提交网络，`fail` 表示失败；`error_code`/`reason` 标识失败原因） |
 | `call_incoming` | 设备→主机 | `phone` | 来电 |
-| `call_disconnected` | 设备→主机 | `phone`, `reason`(`hangup`/`busy`/`no_answer`/`dial_failed`), `raw_reason` | 通话结束（`raw_reason` 为模组原始原因码） |
+| `call_disconnected` | 设备→主机 | `phone`, `reason`(`hangup`/`busy`/`no_answer`/`dial_failed`), `raw_reason` | 通话结束（`raw_reason` 为模组原始原因码）；后端补充 `direction`(`in`/`out`) 与 `duration`(秒) |
 
 - **下行（Python → LuatOS）**：使用 `action` 字段标识命令类型。
 
@@ -163,6 +173,27 @@ python3 -m venv .venv
 |------|--------|------|
 | `--host` | `0.0.0.0` | Web 监听地址 |
 | `--port` | `8000` | Web 监听端口 |
+| `--ssl-cert` | 无 | SSL 证书文件路径（启用 HTTPS） |
+| `--ssl-key` | 无 | SSL 私钥文件路径（启用 HTTPS） |
+
+### HTTPS 访问
+
+系统统一使用 HTTPS 访问（通过 `--ssl-cert` / `--ssl-key` 或环境变量 `SSL_CERT_FILE` / `SSL_KEY_FILE` 指定证书）。
+
+```bash
+# HTTPS 部署示例
+.venv/bin/python web.py --host 0.0.0.0 --port 8000 \
+    --ssl-cert /path/to/cert.pem --ssl-key /path/to/key.pem
+```
+
+### 设备接入方式（pySerial / WebSerial 二选一）
+
+系统不再区分本地/远程，**pySerial 直连与 WebSerial 桥接自由切换、二选一**：
+
+- **pySerial 直连**：引擎自动扫描 `/dev/ttyACM*` 注册设备（默认启用）。
+- **WebSerial 桥接**：浏览器通过 WebSerial API 直连 USB 模组，经 `/ws/webserial` 将数据转发到后端。
+
+**Docker 环境例外**：检测到运行在 Docker 容器内时，自动禁用 pySerial，仅支持 WebSerial 桥接（前端会提示「仅支持 WebSerial」）。也可显式设置 `OMNISMS_DISABLE_PYSERIAL=1` 强制禁用 pySerial。
 
 ### 使用管理脚本（`omnisms.sh`）
 
@@ -194,6 +225,41 @@ sudo ./omnisms.sh uninstall-service # 卸载服务 (需 root)
 
 服务以 `Type=simple` 运行，失败自动重启（`Restart=on-failure`）；日志写入 `omnisms.log`。
 
+### Docker 部署
+
+项目提供 `build.sh` 脚本与 `Dockerfile`，可一键构建并运行容器。Docker 环境下自动生成自签名证书并启用 HTTPS，且**自动禁用 pySerial，仅支持 WebSerial 桥接**（浏览器需与 USB 模组在同一台机器上）。
+
+```bash
+chmod +x build.sh
+
+./build.sh              # 构建当前平台镜像 (自动检测 x86/ARM)
+./build.sh run          # 构建并运行容器 (自动 HTTPS)
+./build.sh logs         # 查看容器日志
+./build.sh status       # 查看运行状态
+./build.sh shell        # 进入容器终端
+./build.sh cleanup      # 清理容器和镜像
+```
+
+`build.sh run` 等价于以下 `docker run` 命令（端口默认 `8000`，若被占用会提示输入新端口）：
+
+```bash
+docker run -d \
+    --name omnisms \
+    --privileged \
+    --restart unless-stopped \
+    -p 8000:8000 \
+    -v omnisms-logs:/app/logs \
+    -v omnisms-db:/app/data \
+    -e TZ=Asia/Shanghai \
+    omnisms:latest
+```
+
+> 说明：
+> - 容器内服务监听 `8000` 端口，映射到宿主机 `8000` 端口，访问地址为 `https://localhost:8000`。
+> - 首次访问会因自签名证书触发浏览器安全提示，点击「高级」→「继续前往」即可。
+> - 数据持久化在 `omnisms-logs`（日志）与 `omnisms-db`（SQLite 数据库）两个 Docker 卷中。
+> - 设备接入依赖浏览器 WebSerial API（需 Chromium 内核浏览器），无需在容器内挂载 USB 设备。
+
 ---
 
 ## 七、REST API 一览
@@ -201,6 +267,7 @@ sudo ./omnisms.sh uninstall-service # 卸载服务 (需 root)
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/` | 主页面 |
+| GET | `/api/env` | 运行环境信息 `{is_docker, pyserial_disabled}`（前端据此决定连接模式） |
 | GET | `/api/devices` | 设备列表（在线 + 数据库离线/备注合并） |
 | GET | `/api/devices/{device_id}` | 单设备详情（`device_id` = 本机号码或 IMEI 兜底） |
 | POST | `/api/disconnect` | 删除设备：从引擎内存移除并断开连接，同时从数据库彻底删除 `{device_id}` |
@@ -208,9 +275,12 @@ sudo ./omnisms.sh uninstall-service # 卸载服务 (需 root)
 | GET | `/api/scan` | 手动扫描：对每个端口独立探测，每个端口最多等待 `duration` 秒（默认 15） |
 | POST | `/api/scan/auto/start` | 启动后台自动扫描（引擎启动时已默认开启） |
 | POST | `/api/scan/auto/stop` | 停止后台自动扫描（不影响已注册设备） |
-| POST | `/api/sms/send` | 发送短信 `{device_id, phone, text}` |
+| POST | `/api/scan/stop` | 提前停止正在进行的手动扫描 |
+| GET | `/api/scan/status` | 查询扫描状态（`scanning` / `auto_scanning`） |
+| POST | `/api/sms/send` | 发送短信 `{device_id, phone, text}`（下发失败返回 `502`） |
 | GET | `/api/sms/conversations?device_id=` | 短信记录（扁平，peer_phone 原样返回；聚合与展示由前端完成） |
 | GET | `/api/sms/messages?device_id=&peer_phone=` | 某原始号码的全部消息（精确匹配） |
+| POST | `/api/sms/purge` | 清空指定号码短信记录 `{device_id?, phone, confirm, dry_run}`（需 `confirm=true`，含事务回滚） |
 | GET | `/api/calls?device_id=` | 通话记录（扁平，peer_phone 原样返回；聚合与展示由前端完成） |
 | GET | `/api/calls/conversations?device_id=` | 通话记录（扁平，同 `/api/calls`） |
 | POST | `/api/call/dial`（`/api/call/make`） | 拨号 `{device_id, phone}` |
@@ -225,7 +295,12 @@ sudo ./omnisms.sh uninstall-service # 卸载服务 (需 root)
 - `log`：`{timestamp, level, logger, message, module}`
 - `device_event`：`boot` / `keepalive` / `disconnect`
 - `sms_event`：`sms_received` / `sms_sent_result`
-- `call_event`：`call_incoming` / `call_disconnected`
+- `call_event`：`call_incoming` / `call_disconnected`（`call_disconnected` 含 `direction` 与真实 `duration` 秒数）
+
+### WebSocket 桥接（`/ws/webserial`）
+WebSerial 桥接模式下浏览器经此端点桥接 USB 数据，协议：
+- 浏览器 → 后端：`{"type":"raw_line","data":"<原始JSON行>"}`、`{"type":"register",...}`、`{"type":"ping"}`
+- 后端 → 浏览器：`{"type":"registered","bridge_id":...}`、`{"type":"command","action":...}`、`{"type":"pong"}`、`{"type":"device_registered","device_id":...}`
 
 ---
 
@@ -242,6 +317,7 @@ sudo ./omnisms.sh uninstall-service # 卸载服务 (需 root)
 | `LUAT_VID` / `LUAT_PID` | `0x19D1` / `0x0001` | Air780 家族 USB 过滤（历史字段，始终纳入匹配） |
 | `LUAT_VID_PID_LIST` | `[(0x19D1, 0x0001)]` | 兼容的 USB VID/PID 列表，覆盖 Air780E/EG/EP/EH；如需支持更多变体在此追加 `(vid, pid)` 元组 |
 | `PORT_PATTERN` | `/dev/ttyACM\d+` | 真实串口匹配 |
+| `DISABLE_PYSERIAL` | `False` | 禁用 pySerial 直连（Docker 环境由 `web.py` 自动置为 `True`） |
 | `DB_PATH` | `omnisms.db` | 数据库路径 |
 | `LOG_DIR` / `LOG_FILE` | `logs` / `logs/omnisms.log` | 日志目录/文件 |
 
@@ -250,6 +326,7 @@ sudo ./omnisms.sh uninstall-service # 卸载服务 (需 root)
 ## 九、已知限制 / 备注
 
 - 设备仅由引擎自动发现注册（真实 USB 串口），不支持手动指定串口路径。
+- Docker 环境下 pySerial 被禁用，设备接入依赖浏览器 WebSerial API（需 Chromium 内核浏览器，且浏览器与 USB 模组在同一台机器上）。
 - 真实硬件部署时，需将 `Luatos/` 下四个 `.lua`（`main` / `sms_handler` / `call_handler` / `util_netled`）烧录到 Air780 家族模组，并按硬件设置 `main.lua` 中的 `DEVICE_MODEL`，随后运行 `sys.run()`。
 
 ---

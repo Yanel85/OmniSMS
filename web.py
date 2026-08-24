@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OmniSMS设备与通讯管理系统 v2.0.0- Air780系列设备短信通话融合管理程序
+OmniSMS设备与通讯管理系统 v3.0.0- Air780系列设备短信通话融合管理程序
 基于 FastAPI + Tailwind CSS 的 Web 管理界面
 """
 
@@ -10,9 +10,11 @@ import os
 import re
 import asyncio
 import threading
+import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from itertools import islice
 from typing import Dict, List, Optional
-from dataclasses import asdict
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -22,7 +24,7 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 # 导入核心引擎
-from omnisms import OmniSMSEngine, Config, setup_logging
+from omnisms import OmniSMSEngine, Config, setup_logging, WebSerialVirtualPort, utc_timestamp
 from database import Database
 
 # ==================== 配置 ====================
@@ -61,23 +63,27 @@ def normalize_outgoing_phone(raw: str) -> str:
     s = re.sub(r"[\s\-\(\)\.]", "", str(raw).strip())
     return s
 
-# ==================== FastAPI 应用 ====================
-app = FastAPI(
-    title="OmniSMS",
-    description="Air780系列设备短信通话融合管理程序",
-    version="2.0.0"
-)
 
-# 模板和静态文件（使用绝对路径）
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
-app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
+def is_docker_environment() -> bool:
+    """检测当前是否运行在 Docker 容器内。
 
-# 捕获运行中的事件循环, 供引擎业务线程 (串口读取线程) 安全地推送 WebSocket
-@app.on_event("startup")
-async def _capture_event_loop():
-    global LOOP
-    LOOP = asyncio.get_running_loop()
+    判定依据 (任一命中即视为 Docker 环境):
+      - 存在 /.dockerenv 文件
+      - /proc/1/cgroup 中包含 docker / kubepods / containerd 关键字
+      - 环境变量 OMNISMS_FORCE_DOCKER=1 显式强制
+    """
+    if os.environ.get('OMNISMS_FORCE_DOCKER', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+        return True
+    if os.path.exists('/.dockerenv'):
+        return True
+    try:
+        with open('/proc/1/cgroup', 'r') as f:
+            content = f.read().lower()
+        if any(k in content for k in ('docker', 'kubepods', 'containerd', 'libpod')):
+            return True
+    except (OSError, IOError):
+        pass
+    return False
 
 # 全局引擎实例
 engine: Optional[OmniSMSEngine] = None
@@ -85,8 +91,32 @@ engine: Optional[OmniSMSEngine] = None
 # 全局数据库实例
 db: Optional[Database] = None
 
-# 全局事件循环 (在 startup 中捕获, 供引擎业务线程安全地推送 WebSocket)
+# 全局事件循环 (在 lifespan 启动时捕获, 供引擎业务线程安全地推送 WebSocket)
 LOOP = None
+
+# 是否运行在 Docker 容器内 (Docker 环境仅支持 WebSerial 桥接, 禁用 pySerial)
+IS_DOCKER = is_docker_environment()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global LOOP
+    LOOP = asyncio.get_running_loop()
+    yield
+
+
+# ==================== FastAPI 应用 ====================
+app = FastAPI(
+    title="OmniSMS",
+    description="Air780系列设备短信通话融合管理程序",
+    version="3.0.0",
+    lifespan=lifespan,
+)
+
+# 模板和静态文件（使用绝对路径）
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
+app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 
 # WebSocket 连接管理器
 class ConnectionManager:
@@ -101,10 +131,139 @@ class ConnectionManager:
         self.active_connections.remove(websocket)
 
     async def broadcast(self, message: dict):
-        for connection in self.active_connections:
+        for connection in list(self.active_connections):
             await connection.send_json(message)
 
 manager = ConnectionManager()
+
+# ==================== WebSerial 桥接支持 ====================
+
+# 全局活跃 WebSerial 桥接表: {bridge_id: WebSerialBridge}
+active_bridges: Dict[str, 'WebSerialBridge'] = {}
+
+
+class WebSerialBridge:
+    """管理单个浏览器 WebSerial 连接与后端引擎之间的桥接。
+
+    数据流:
+      浏览器 --[WebSerial API]--> USB 设备 (物理)
+      浏览器 --[/ws/webserial]--> 后端引擎 (逻辑)
+
+    职责:
+      - 接收浏览器上报的原始数据行, 喂入引擎的 WebSerialVirtualPort
+      - 将引擎下发的命令通过 WebSocket 推送给浏览器, 由浏览器写入 USB
+      - 管理 WebSerial 设备的生命周期 (注册/更新/注销)
+    """
+
+    def __init__(self, bridge_id: str, websocket: WebSocket, engine_instance: OmniSMSEngine):
+        self.bridge_id = bridge_id
+        self.ws = websocket
+        self.engine = engine_instance
+        self.is_connected = True
+
+        # 关联的设备 (identify 握手成功后填充)
+        self.device_id: Optional[str] = None
+        self.virtual_port: Optional[WebSerialVirtualPort] = None
+
+        logger = logging.getLogger("OmniSMS-WSBridge")
+        logger.info(f"WebSerial bridge created: {bridge_id}")
+
+    async def handle_client_message(self, msg: dict):
+        """处理来自浏览器的消息"""
+        msg_type = msg.get("type")
+
+        if msg_type == "raw_line":
+            # 原始数据行 -> 转发给引擎处理
+            raw_line = msg.get("data", "")
+            if raw_line:
+                await self._feed_to_engine(raw_line)
+
+        elif msg_type == "register":
+            # 注册/心跳 (可扩展)
+            logging.getLogger("OmniSMS-WSBridge").debug(f"WebSerial client register: {msg}")
+
+        elif msg_type == "ping":
+            # 心跳响应
+            await self.ws.send_json({"type": "pong", "timestamp": utc_timestamp()})
+
+    async def _feed_to_engine(self, raw_line: str):
+        """将原始数据行喂入引擎 (复用 _handle_incoming_message)"""
+        logger = logging.getLogger("OmniSMS-WSBridge")
+
+        if not self.device_id or not self.virtual_port:
+            # 尚未完成 identify 握手, 尝试解析 boot 事件进行自动注册
+            await self._try_auto_register(raw_line)
+            return
+
+        # 已注册设备: 直接通过 virtual_port.feed_data 喂入数据
+        # 引擎的 reader_loop 会从 virtual_port.readline() 读取并调用 _handle_incoming_message
+        if self.virtual_port:
+            self.virtual_port.feed_data(raw_line)
+            logger.debug(f"WebSerial data fed to engine ({self.device_id}): {raw_line[:80]}")
+
+    async def _try_auto_register(self, raw_line: str):
+        """尝试从原始数据中解析 boot/keepalive 事件并自动注册设备"""
+        logger = logging.getLogger("OmniSMS-WSBridge")
+
+        try:
+            msg = json.loads(raw_line)
+            if isinstance(msg, dict) and msg.get("event") in ("boot", "keepalive"):
+                imei = msg.get("imei", "")
+                if len(imei) >= 15:
+                    # 调用引擎的 register_webserial_device
+                    device_id = self.engine.register_webserial_device(self.bridge_id, msg)
+
+                    if device_id:
+                        self.device_id = device_id
+                        # 获取引擎创建的 virtual_port 并绑定 bridge
+                        device = self.engine.get_device(device_id)
+                        if device and isinstance(device.serial_obj, WebSerialVirtualPort):
+                            self.virtual_port = device.serial_obj
+                            self.virtual_port.bridge = self
+
+                        logger.info(f"WebSerial auto-registered device: {device_id} via {self.bridge_id}")
+
+                        # 通知前端
+                        await self.ws.send_json({
+                            "type": "device_registered",
+                            "device_id": device_id,
+                            "connection_type": "webserial",
+                            "timestamp": utc_timestamp()
+                        })
+
+        except json.JSONDecodeError:
+            pass  # 非 JSON 行, 忽略
+        except Exception as e:
+            logger.error(f"WebSerial auto-register error: {e}")
+
+    async def poll_and_send_command(self):
+        """检查引擎是否有待发送命令, 有则推送给浏览器"""
+        if not self.engine or not self.device_id:
+            return
+
+        command = self.engine.get_webserial_command(self.bridge_id)
+        if command:
+            await self.ws.send_json({
+                "type": "command",
+                **command,
+                "timestamp": utc_timestamp()
+            })
+            logging.getLogger("OmniSMS-WSBridge").debug(
+                f"WebSerial command sent to browser: {command.get('action', '?')}"
+            )
+
+    def disconnect(self):
+        """清理桥接资源"""
+        self.is_connected = False
+
+        # 从引擎移除关联设备
+        if self.device_id:
+            self.engine.unregister_webserial_device(self.bridge_id)
+
+        logging.getLogger("OmniSMS-WSBridge").info(
+            f"WebSerial bridge disconnected: {self.bridge_id} (was device: {self.device_id})"
+        )
+
 
 # 内存日志缓存 (供前端启动时填充; 持久化由日志文件负责)
 log_cache: List[dict] = []
@@ -135,10 +294,15 @@ class PurgeSMSRequest(BaseModel):
 
 
 # ==================== 初始化引擎 ====================
-def init_engine():
-    """初始化 OmniSMS 引擎"""
+def init_engine(disable_pyserial: bool = False):
+    """初始化 OmniSMS 引擎
+
+    Args:
+        disable_pyserial: 是否禁用 pySerial 直连 (Docker 环境为 True, 仅支持 WebSerial 桥接)
+    """
     global engine, db
     config = Config()
+    config.DISABLE_PYSERIAL = disable_pyserial
     setup_logging(config)
     db = Database(config.DB_PATH)
     engine = OmniSMSEngine(config)
@@ -167,7 +331,9 @@ def broadcast_engine_event(event_type: str, device_id: str, data: dict):
     }
     
     try:
-        loop = LOOP if LOOP is not None else asyncio.get_event_loop()
+        loop = LOOP
+        if loop is None:
+            loop = asyncio.get_running_loop()
         loop.call_soon_threadsafe(
             lambda: asyncio.ensure_future(manager.broadcast(payload))
         )
@@ -200,7 +366,9 @@ class WebLogHandler(logging.Handler):
 
             # 推送 WebSocket
             try:
-                loop = LOOP if LOOP is not None else asyncio.get_running_loop()
+                loop = LOOP
+                if loop is None:
+                    loop = asyncio.get_running_loop()
                 loop.call_soon_threadsafe(
                     lambda: asyncio.ensure_future(manager.broadcast({"type": "log", "data": log_entry}))
                 )
@@ -286,9 +454,12 @@ class LogFileReader:
 
     def get_logs(self, level=None, keyword=None, start_time=None, end_time=None,
                  limit: int = 200, offset: int = 0):
-        records = list(self._iter_records(level, keyword, start_time, end_time))
-        total = len(records)
-        return records[offset:offset + limit], total
+        it = self._iter_records(level, keyword, start_time, end_time)
+        # 跳过 offset 条后取 limit 条, 避免一次性物化全部记录
+        records = list(islice(it, offset, offset + limit))
+        # total 需单独统计 (生成器已消费, 重新迭代计数)
+        total = sum(1 for _ in self._iter_records(level, keyword, start_time, end_time))
+        return records, total
 
     def get_recent(self, limit: int = 200):
         """获取最近 N 条日志 (供前端启动时填充)"""
@@ -316,6 +487,19 @@ class LogFileReader:
 async def index(request: Request):
     """主页面"""
     return templates.TemplateResponse(request, "index.html")
+
+
+@app.get("/api/env")
+async def get_env():
+    """返回运行环境信息, 供前端决定连接模式。
+
+    - is_docker: 是否运行在 Docker 容器内 (Docker 环境仅支持 WebSerial 桥接)
+    - pyserial_disabled: 后端是否已禁用 pySerial 直连
+    """
+    return JSONResponse(content={
+        "is_docker": IS_DOCKER,
+        "pyserial_disabled": bool(engine and engine.config.DISABLE_PYSERIAL),
+    })
 
 
 @app.get("/api/devices")
@@ -346,6 +530,7 @@ async def get_devices():
             "net_status": getattr(device, 'net_status', None),
             "series": getattr(device, 'series', "") or "",
             "model": getattr(device, 'model', "") or "",
+            "connection_type": getattr(device, 'connection_type', 'pyserial'),
             "remark": "",
         }
     
@@ -528,6 +713,7 @@ async def get_device(device_id: str):
             "last_seen": device.last_seen,
             "series": getattr(device, 'series', "") or "",
             "model": getattr(device, 'model', "") or "",
+            "remark": getattr(device, 'remark', "") or "",
         }
     })
 
@@ -548,6 +734,11 @@ async def send_sms(request: SendSMSRequest):
     
     phone = normalize_outgoing_phone(request.phone)
     task_id = engine.send_sms(request.device_id, phone, request.text)
+    if task_id is None:
+        return JSONResponse(status_code=502, content={
+            "success": False,
+            "message": "短信发送失败：设备离线或命令下发失败"
+        })
     return JSONResponse(content={
         "success": True,
         "message": "短信发送命令已下发",
@@ -764,30 +955,124 @@ async def websocket_log(websocket: WebSocket):
         manager.disconnect(websocket)
 
 
+@app.websocket("/ws/webserial")
+async def websocket_webserial_bridge(websocket: WebSocket):
+    """WebSerial 桥接 WebSocket 端点。
+
+    浏览器通过此端点将 WebSerial API 收到的原始数据转发到后端,
+    后端通过此端点将下行命令下发给浏览器写入 USB。
+
+    协议:
+      浏览器 -> 后端: {"type": "raw_line", "data": "<原始JSON行>"}
+      后端 -> 浏览器: {"type": "command", "action": "...", ...}
+      浏览器 -> 后端: {"type": "register", ...}
+      后端 -> 浏览器: {"type": "registered", "bridge_id": "..."}
+    """
+    global active_bridges
+
+    await manager.connect(websocket)
+    bridge_id = f"ws-{uuid.uuid4().hex[:12]}"
+    bridge = WebSerialBridge(bridge_id, websocket, engine)
+
+    active_bridges[bridge_id] = bridge  # 全局注册
+    ws_logger = logging.getLogger("OmniSMS-WSBridge")
+
+    try:
+        ws_logger.info(f"WebSerial bridge connected: {bridge_id}")
+
+        # 发送注册确认
+        await websocket.send_json({
+            "type": "registered",
+            "bridge_id": bridge_id,
+            "status": "ok",
+            "timestamp": utc_timestamp()
+        })
+
+        # 消息处理循环 (同时轮询待发送命令)
+        while True:
+            try:
+                # 使用 asyncio.wait_for 实现带超时的接收, 以便定期检查命令队列
+                raw_message = await asyncio.wait_for(
+                    websocket.receive_text(), timeout=0.5
+                )
+
+                try:
+                    msg = json.loads(raw_message)
+                    await bridge.handle_client_message(msg)
+                except json.JSONDecodeError:
+                    ws_logger.warning(f"Invalid JSON from WebSerial client: {raw_message[:100]}")
+                except Exception as e:
+                    ws_logger.error(f"Error handling WebSerial message: {e}")
+
+            except asyncio.TimeoutError:
+                # 超时 -> 轮询命令队列
+                pass
+
+            # 检查是否有待发送的命令
+            await bridge.poll_and_send_command()
+
+    except WebSocketDisconnect:
+        ws_logger.info(f"WebSerial bridge disconnected: {bridge_id}")
+    except Exception as e:
+        ws_logger.error(f"WebSerial bridge error ({bridge_id}): {e}")
+    finally:
+        bridge.disconnect()
+        active_bridges.pop(bridge_id, None)
+        manager.disconnect(websocket)
+
+
 # ==================== 启动入口 ====================
 if __name__ == "__main__":
     import argparse
+    import os as _os
     
     # 命令行参数解析
     parser = argparse.ArgumentParser(description="OmniSMS设备与通讯管理系统 - Web 管理界面")
     parser.add_argument("--host", type=str, default=WEB_HOST, help="Web 服务监听地址")
     parser.add_argument("--port", type=int, default=WEB_PORT, help="Web 服务端口")
+    parser.add_argument("--ssl-cert", type=str, default=None, help="SSL 证书文件路径 (启用 HTTPS)")
+    parser.add_argument("--ssl-key", type=str, default=None, help="SSL 私钥文件路径 (启用 HTTPS)")
     args = parser.parse_args()
     
     # 应用配置
     WEB_HOST = args.host
     WEB_PORT = args.port
     
+    # SSL/HTTPS 配置 (支持命令行参数或环境变量)
+    ssl_certfile = args.ssl_cert or _os.environ.get('SSL_CERT_FILE')
+    ssl_keyfile = args.ssl_key or _os.environ.get('SSL_KEY_FILE')
+    
+    # 判断是否启用 HTTPS
+    https_enabled = bool(ssl_certfile and ssl_keyfile and _os.path.exists(ssl_certfile) and _os.path.exists(ssl_keyfile))
+    
+    # 是否禁用 pySerial:
+    #   1. Docker 环境时自动禁用 (仅支持 WebSerial 桥接)
+    #   2. 显式设置环境变量 OMNISMS_DISABLE_PYSERIAL=1 时禁用
+    disable_pyserial = IS_DOCKER or _os.environ.get('OMNISMS_DISABLE_PYSERIAL', '').strip().lower() in ('1', 'true', 'yes', 'on')
+    
     print("=" * 60)
     print("OmniSMS设备与通讯管理系统 -  Web Interface Starting...")
-    print(f"Access: http://{WEB_HOST}:{WEB_PORT}")
+    
+    if https_enabled:
+        print(f"Access: https://{WEB_HOST}:{WEB_PORT}")
+        print(f"SSL Certificate: {ssl_certfile}")
+        print("⚠️  使用自签名证书，浏览器会提示不安全，请选择'继续访问'")
+    else:
+        print(f"Access: http://{WEB_HOST}:{WEB_PORT}")
+        print("💡 提示: 使用 --ssl-cert 和 --ssl-key 参数启用 HTTPS")
+    
+    if IS_DOCKER:
+        print("🐳 Docker 环境: pySerial 已禁用, 仅支持 WebSerial 桥接")
+    elif disable_pyserial:
+        print("🔌 pySerial 已禁用 (OMNISMS_DISABLE_PYSERIAL=1), 仅使用 WebSerial 桥接")
+    
     print("=" * 60)
     
     # 获取 logger
     logger = logging.getLogger("OmniSMS")
     
     # 初始化引擎
-    init_engine()
+    init_engine(disable_pyserial=disable_pyserial)
     
     # 配置日志处理器
     web_handler = WebLogHandler()
@@ -796,5 +1081,9 @@ if __name__ == "__main__":
     web_handler.setFormatter(formatter)
     logging.getLogger().addHandler(web_handler)
     
-    # 启动服务
-    uvicorn.run(app, host=WEB_HOST, port=WEB_PORT)
+    # 启动服务 (支持 HTTP/HTTPS)
+    if ssl_certfile and ssl_keyfile and _os.path.exists(ssl_certfile) and _os.path.exists(ssl_keyfile):
+        uvicorn.run(app, host=WEB_HOST, port=WEB_PORT, 
+                    ssl_certfile=ssl_certfile, ssl_keyfile=ssl_keyfile)
+    else:
+        uvicorn.run(app, host=WEB_HOST, port=WEB_PORT)

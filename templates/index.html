@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OmniSMS设备与通讯管理系统 v2.0.0- Air780系列设备短信通话融合管理程序  </title>
+    <title>OmniSMS设备与通讯管理系统 v3.0.0- Air780系列设备短信通话融合管理程序  </title>
     
     <!-- Tailwind CSS CDN -->
     <script src="https://cdn.tailwindcss.com"></script>
@@ -36,7 +36,7 @@
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.141 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0"/>
                 </svg>
                 <span class="text-xl font-bold text-white tracking-tight">OmniSMS</span>
-                <span class="text-xs font-semibold px-2 py-0.5 rounded-full bg-brand-500/20 text-blue-300">v2.0</span>
+                <span class="text-xs font-semibold px-2 py-0.5 rounded-full bg-brand-500/20 text-blue-300">v3.0</span>
             </div>
 
             <!-- 导航标签 -->
@@ -69,6 +69,17 @@
 
             <!-- 右侧操作 -->
             <div class="flex items-center gap-4">
+                <!-- 连接模式指示器 (WebSerial 备份支持) -->
+                <div id="connection-mode-indicator" class="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-white/5 border border-white/10 text-xs font-medium">
+                    <span class="text-slate-500">○ 未连接</span>
+                </div>
+
+                <!-- WebSerial 桥接切换按钮 (Docker 环境必须 / 非 Docker 可选) -->
+                <button id="btnWebSerialBridge" onclick="toggleWebSerialBridge()" style="display: none;" class="px-3 py-1.5 bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/30 rounded-lg text-xs font-medium text-amber-300 transition-colors flex items-center gap-1.5" title="WebSerial 桥接模式 (Docker 环境必须 / 非 Docker 可选)">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7h2l-4-4-4 4h2v8.2A3 3 0 0 0 9 18v1a3 3 0 1 0 3-3 3 3 0 0 0 1 .2V9.8l3 2.2a3 3 0 1 0 1.2-1.6L15 8.8V7Z"/></svg>
+                    WebSerial模式
+                </button>
+
                 <div id="connectionStatus" class="flex items-center gap-2 text-sm text-slate-400">
                     <span class="status-dot offline w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
                     <span class="status-text">离线</span>
@@ -209,7 +220,7 @@
                         <div class="input-row flex items-center gap-3 mb-3" id="smsPhoneRow" style="display:none;">
                             <label class="input-label text-sm text-slate-500 whitespace-nowrap">目标号码:</label>
                             <input type="tel" id="smsTargetPhone" class="input-phone flex-1 px-3 py-2 border border-slate-200 rounded-lg text-sm outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/10"
-                                   placeholder="+86xxxxxxxxxxx" onfocus="onPhoneFocus(this)">
+                                   placeholder="+86xxxxxxxxxxx">
                         </div>
                         <div class="textarea-row relative mb-3">
                             <textarea id="smsMessageText" class="input-message w-full px-3 py-3 border border-slate-200 rounded-lg text-sm resize-none outline-none min-h-[80px] max-h-[150px] focus:border-brand-500 focus:ring-2 focus:ring-brand-500/10"

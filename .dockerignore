@@ -1,0 +1,54 @@
+# Docker 忽略文件
+# 减少构建上下文大小，加速构建
+
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 日志 (由 Docker volume 持久化)
+logs/
+*.log
+
+# 数据库 (由 Docker volume 持久化)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# 文档 (不需要打包到镜像)
+README.md
+CHANGELOG.md
+LICENSE
+Luatos/
+
+# Docker 相关 (避免递归)
+docker-compose*.yml
+.docker/
+
+# 临时文件
+*.tmp
+*.temp
+*.bak

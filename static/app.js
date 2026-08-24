@@ -1,5 +1,5 @@
 /**
- * OmniSMS设备与通讯管理系统 v2.0.0- Air780系列设备短信通话融合管理程序 
+ * OmniSMS设备与通讯管理系统 v3.0.0- Air780系列设备短信通话融合管理程序 
  * 桌面端聊天式布局 + 实时通信
  */
 
@@ -27,13 +27,452 @@ const AppState = {
     deviceRemarks: {},
 };
 
+// ==================== 连接模式管理 (WebSerial 桥接支持) ====================
+const ConnectionMode = {
+    PY_SERIAL: 'pyserial',      // 后端 pyserial 直连 (本地模式)
+    WEBSERIAL: 'webserial',     // 浏览器 WebSerial 桥接到后端 (本地/远程均可)
+    NONE: 'none'                // 无连接
+};
+
+let currentMode = ConnectionMode.NONE;
+
+// WebSerial 桥接状态
+let webSerialBridgePort = null;           // WebSerial SerialPort 对象
+let webSerialBridgeReader = null;         // WebSerial ReadableStreamDefaultReader
+let webSerialBridgeWS = null;             // /ws/webserial WebSocket 连接
+let webSerialBridgeId = null;             // 后端分配的 bridge_id
+let isWebSerialBridgeReading = false;     // 是否正在从 WebSerial 读取数据
+
+/**
+ * 是否运行在 Docker 容器内 (由后端 /api/env 返回)。
+ * Docker 环境仅支持 WebSerial 桥接, 禁用 pySerial 直连。
+ */
+let isDockerEnv = false;
+
+/**
+ * 从后端获取运行环境信息 (是否 Docker 环境)。
+ */
+async function fetchEnvironmentInfo() {
+    try {
+        const resp = await fetch('/api/env');
+        if (resp.ok) {
+            const data = await resp.json();
+            isDockerEnv = !!data.is_docker;
+        }
+    } catch (e) {
+        console.warn('获取环境信息失败:', e);
+    }
+}
+
+/**
+ * 检测当前运行环境并确定最佳连接模式。
+ *
+ * 规则:
+ *   - Docker 环境: 仅支持 WebSerial 桥接模式 (浏览器 USB → WebSocket → 后端)
+ *   - 非 Docker 环境: pySerial (后端直连) 与 WebSerial 自由切换 (二选一)
+ *     · 后端有在线设备时默认 pySerial，用户可手动切换到 WebSerial
+ *     · 后端无设备时显示两种选项供用户选择
+ */
+function detectConnectionMode() {
+    if (isDockerEnv) {
+        // Docker 环境: 只能使用 WebSerial
+        return ConnectionMode.WEBSERIAL;
+    }
+
+    // 非 Docker 环境: 检查后端是否有 pyserial 在线设备
+    const hasBackendDevices = AppState.devices.size > 0
+        && Array.from(AppState.devices.values()).some(d => d.status === 'online');
+
+    if (hasBackendDevices) {
+        return ConnectionMode.PY_SERIAL;
+    }
+    return ConnectionMode.NONE;
+}
+
+/**
+ * 切换到 WebSerial 桥接模式
+ * 非 Docker 环境: 用户手动切换; Docker 环境: 唯一可用连接方式
+ */
+async function switchToWebSerialBackup() {
+    if (!checkWebSerialSupport()) return false;
+
+    try {
+        // 非 Docker 环境: 先释放后端 pySerial 占用的设备, 避免端口冲突
+        if (!isDockerEnv) {
+            await releaseBackendPySerialDevices();
+        }
+
+        await connectWebSerialUSB();
+        await connectWebSerialBridge();
+
+        currentMode = ConnectionMode.WEBSERIAL;
+        updateConnectionModeIndicator();
+
+        const msg = isDockerEnv
+            ? 'WebSerial 桥接已连接，设备数据将通过浏览器转发到后端'
+            : '已切换到 WebSerial 模式，所有数据将通过后端统一处理';
+        showToast(msg, 'success');
+
+        setTimeout(() => refreshDevices(), 1500);
+        return true;
+    } catch (e) {
+        showToast(`WebSerial 连接失败: ${e.message}`, 'error');
+        return false;
+    }
+}
+
+/**
+ * 释放后端 pySerial 占用的设备 (非 Docker 环境切换到 WebSerial 前调用)
+ * 1. 停止后端自动扫描 (避免重新占用 USB 串口)
+ * 2. 关闭所有 pyserial 连接类型的设备, 释放 USB 串口供浏览器 WebSerial 使用
+ */
+async function releaseBackendPySerialDevices() {
+    // 1. 停止后端自动扫描
+    try {
+        await fetch('/api/scan/auto/stop', { method: 'POST' });
+    } catch (e) {
+        console.warn('停止自动扫描失败:', e);
+    }
+
+    const pyserialDevices = Array.from(AppState.devices.values())
+        .filter(d => d.connection_type !== 'webserial' && d.status === 'online');
+
+    if (pyserialDevices.length === 0) return;
+
+    showToast(`正在释放后端直连设备 (${pyserialDevices.length} 个)...`, 'info');
+
+    for (const device of pyserialDevices) {
+        try {
+            const resp = await fetch('/api/disconnect', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ device_id: device.device_id })
+            });
+            if (!resp.ok) {
+                const err = await resp.json();
+                throw new Error(err.detail || `释放设备失败 (${resp.status})`);
+            }
+        } catch (e) {
+            console.warn(`释放设备 ${device.device_id} 失败:`, e);
+        }
+    }
+
+    // 等待串口完全释放
+    await sleep(500);
+}
+
+/**
+ * 通过 WebSerial API 连接 USB 设备 (桥接模式)
+ */
+async function connectWebSerialUSB() {
+    if (!navigator.serial) throw new Error('WebSerial API 不可用');
+
+    webSerialBridgePort = await navigator.serial.requestPort();
+
+    try {
+        await webSerialBridgePort.open({ baudRate: 115200 });
+    } catch (e) {
+        // 端口打开失败, 给出明确提示
+        const msg = String(e.message || e);
+        if (msg.includes('already open') || msg.includes('in use') || msg.includes('unavailable')) {
+            throw new Error('USB 端口被占用。请确认后端 pySerial 已释放该设备，或关闭其他占用该端口的程序后重试');
+        }
+        if (msg.includes('access denied') || msg.includes('permission')) {
+            throw new Error('USB 端口访问被拒绝。请检查设备权限 (可能需要 udev 规则或管理员权限)');
+        }
+        throw new Error(`打开 USB 端口失败: ${msg}`);
+    }
+
+    try {
+        await webSerialBridgePort.setSignals({ dataTerminalReady: true });
+    } catch (e) {
+        // DTR 设置失败不致命, 继续
+        console.warn('设置 DTR 信号失败:', e);
+    }
+
+    showToast('WebSerial USB 已连接，正在等待设备响应...', 'info');
+    isWebSerialBridgeReading = true;
+    readWebSerialBridgeLoop();
+}
+
+/**
+ * WebSerial 桥接数据读取循环
+ * 从 USB 读取原始数据行，通过桥接 WebSocket 发送到后端
+ */
+async function readWebSerialBridgeLoop() {
+    while (isWebSerialBridgeReading && webSerialBridgePort && webSerialBridgePort.readable) {
+        try {
+            webSerialBridgeReader = webSerialBridgePort.readable.getReader();
+            let buffer = '';
+            const decoder = new TextDecoder();
+
+            while (isWebSerialBridgeReading) {
+                const { value, done } = await webSerialBridgeReader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop();
+
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (trimmed) {
+                        sendToWebSerialBridge(trimmed);
+                        addLogEntry({ level: 'DEBUG', message: `WebSerial RX: ${trimmed.substring(0, 100)}`, timestamp: new Date().toISOString() });
+                    }
+                }
+            }
+        } catch (e) {
+            console.error('WebSerial bridge read error:', e);
+            if (isWebSerialBridgeReading) {
+                addLogEntry({ level: 'ERROR', message: `WebSerial 读取错误: ${e.message}, 3秒后重连...`, timestamp: new Date().toISOString() });
+                await sleep(3000);
+            }
+        } finally {
+            if (webSerialBridgeReader) {
+                webSerialBridgeReader.releaseLock();
+                webSerialBridgeReader = null;
+            }
+        }
+    }
+}
+
+/**
+ * 建立与后端的 WebSerial 桥接 WebSocket 连接
+ */
+function connectWebSerialBridge() {
+    return new Promise((resolve, reject) => {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws/webserial`;
+
+        webSerialBridgeWS = new WebSocket(wsUrl);
+
+        webSerialBridgeWS.onopen = () => {
+            addLogEntry({ level: 'INFO', message: 'WebSerial 桥接 WebSocket 已连接', timestamp: new Date().toISOString() });
+            resolve();
+        };
+
+        webSerialBridgeWS.onmessage = (event) => {
+            try {
+                const msg = JSON.parse(event.data);
+                handleWebSerialBridgeMessage(msg);
+            } catch (e) {
+                console.error('Invalid bridge message:', event.data);
+            }
+        };
+
+        webSerialBridgeWS.onerror = () => reject(new Error('WebSocket 桥接连接错误'));
+
+        webSerialBridgeWS.onclose = () => {
+            addLogEntry({ level: 'WARN', message: 'WebSerial 桥接 WebSocket 已断开', timestamp: new Date().toISOString() });
+            webSerialBridgeWS = null;
+            webSerialBridgeId = null;
+
+            if (currentMode === ConnectionMode.WEBSERIAL && isWebSerialBridgeReading) {
+                addLogEntry({ level: 'INFO', message: '3秒后尝试重新连接 WebSerial 桥接...', timestamp: new Date().toISOString() });
+                setTimeout(() => {
+                    if (currentMode === ConnectionMode.WEBSERIAL) {
+                        connectWebSerialBridge().catch(e =>
+                            addLogEntry({ level: 'ERROR', message: `桥接重连失败: ${e.message}`, timestamp: new Date().toISOString() })
+                        );
+                    }
+                }, 3000);
+            }
+        };
+    });
+}
+
+/**
+ * 发送原始数据行到后端 (通过桥接 WebSocket)
+ */
+function sendToWebSerialBridge(rawLine) {
+    if (webSerialBridgeWS && webSerialBridgeWS.readyState === WebSocket.OPEN) {
+        webSerialBridgeWS.send(JSON.stringify({
+            type: 'raw_line',
+            data: rawLine,
+            timestamp: new Date().toISOString()
+        }));
+    }
+}
+
+/**
+ * 处理来自后端 WebSerial 桥接的消息
+ */
+function handleWebSerialBridgeMessage(msg) {
+    switch (msg.type) {
+        case 'registered':
+            webSerialBridgeId = msg.bridge_id;
+            addLogEntry({ level: 'INFO', message: `WebSerial 桥接已注册: ${msg.bridge_id}`, timestamp: new Date().toISOString() });
+            break;
+
+        case 'command':
+            writeWebSerialCommand(msg);
+            break;
+
+        case 'device_registered':
+            addLogEntry({ level: 'INFO', message: `WebSerial 设备已注册: ${msg.device_id}`, timestamp: new Date().toISOString() });
+            refreshDevices();
+            break;
+
+        case 'pong':
+            break;
+
+        default:
+            addLogEntry({ level: 'DEBUG', message: `WebSerial Bridge: ${JSON.stringify(msg).substring(0, 100)}`, timestamp: new Date().toISOString() });
+    }
+}
+
+/**
+ * 将后端下发的命令写入 WebSerial USB
+ */
+async function writeWebSerialCommand(command) {
+    if (!webSerialBridgePort || !webSerialBridgePort.writable) {
+        addLogEntry({ level: 'ERROR', message: 'WebSerial USB 不可写, 无法发送命令', timestamp: new Date().toISOString() });
+        return;
+    }
+
+    try {
+        const writer = webSerialBridgePort.writable.getWriter();
+        const encoder = new TextEncoder();
+
+        const cmdFields = { ...command };
+        delete cmdFields.type;
+        delete cmdFields.timestamp;
+
+        const cmdJson = JSON.stringify(cmdFields) + '\n';
+        await writer.write(encoder.encode(cmdJson));
+        writer.releaseLock();
+
+        addLogEntry({ level: 'DEBUG', message: `WebSerial TX: ${cmdJson.trim().substring(0, 100)}`, timestamp: new Date().toISOString() });
+    } catch (e) {
+        addLogEntry({ level: 'ERROR', message: `WebSerial 写入失败: ${e.message}`, timestamp: new Date().toISOString() });
+    }
+}
+
+/**
+ * 断开 WebSerial 桥接连接
+ */
+async function disconnectWebSerial() {
+    isWebSerialBridgeReading = false;
+
+    if (webSerialBridgeReader) {
+        try { webSerialBridgeReader.releaseLock(); } catch (e) {}
+        webSerialBridgeReader = null;
+    }
+
+    if (webSerialBridgePort) {
+        try { await webSerialBridgePort.close(); } catch (e) {}
+        webSerialBridgePort = null;
+    }
+
+    if (webSerialBridgeWS) {
+        try { webSerialBridgeWS.close(); } catch (e) {}
+        webSerialBridgeWS = null;
+    }
+
+    webSerialBridgeId = null;
+    currentMode = ConnectionMode.NONE;
+    updateConnectionModeIndicator();
+    addLogEntry({ level: 'INFO', message: 'WebSerial 桥接已断开', timestamp: new Date().toISOString() });
+}
+
+/**
+ * 更新连接模式指示器 UI
+ */
+function updateConnectionModeIndicator() {
+    const indicator = document.getElementById('connection-mode-indicator');
+    if (!indicator) return;
+
+    switch (currentMode) {
+        case ConnectionMode.PY_SERIAL:
+            indicator.innerHTML = '<span class="text-emerald-400 text-xs font-medium">● 后端直连</span>';
+            break;
+        case ConnectionMode.WEBSERIAL:
+            indicator.innerHTML = '<span class="text-amber-400 text-xs font-medium">● WebSerial桥接</span>';
+            break;
+        default:
+            indicator.innerHTML = '<span class="text-slate-500 text-xs font-medium">○ 未连接</span>';
+    }
+}
+
+/**
+ * 辅助函数: sleep
+ */
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * 检查浏览器是否支持 WebSerial API
+ */
+function checkWebSerialSupport() {
+    if ('serial' in navigator) return true;
+    showToast('您的浏览器不支持 WebSerial API，请使用 Chrome/Edge 89+ 或其他 Chromium 内核浏览器', 'error');
+    return false;
+}
+
+/**
+ * 切换 WebSerial 桥接连接 (UI 入口)
+ * 非 Docker 环境: 可选切换; Docker 环境: 唯一连接方式
+ */
+async function toggleWebSerialBridge() {
+    const btn = document.getElementById('btnWebSerialBridge');
+
+    if (currentMode === ConnectionMode.WEBSERIAL) {
+        // 当前已连接 -> 断开
+        await disconnectWebSerial();
+        btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7h2l-4-4-4 4h2v8.2A3 3 0 0 0 9 18v1a3 3 0 1 0 3-3 3 3 0 0 0 1 .2V9.8l3 2.2a3 3 0 1 0 1.2-1.6L15 8.8V7Z"/></svg>${isDockerEnv ? '连接设备' : 'WebSerial模式'}`;
+        btn.classList.remove('bg-red-500/20', 'border-red-500/30', 'text-red-300');
+        btn.classList.add('bg-amber-500/20', 'border-amber-500/30', 'text-amber-300');
+        showToast('WebSerial 桥接已断开', 'info');
+    } else {
+        // 未连接 -> 尝试连接
+        if (!checkWebSerialSupport()) return;
+
+        btn.innerHTML = `<svg class="w-3.5 h-3.5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>连接中...`;
+        const success = await switchToWebSerialBackup();
+
+        if (success) {
+            btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>断开连接`;
+            btn.classList.remove('bg-amber-500/20', 'border-amber-500/30', 'text-amber-300');
+            btn.classList.add('bg-red-500/20', 'border-red-500/30', 'text-red-300');
+        } else {
+            btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7h2l-4-4-4 4h2v8.2A3 3 0 0 0 9 18v1a3 3 0 1 0 3-3 3 3 0 0 0 1 .2V9.8l3 2.2a3 3 0 1 0 1.2-1.6L15 8.8V7Z"/></svg>${isDockerEnv ? '连接设备' : 'WebSerial模式'}`;
+        }
+    }
+}
+
 // ==================== 初始化 ====================
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
     initNavigation();
     initWebSocket();
     loadDevices();
     startPolling();
     syncScanStatus();
+
+    // 先获取运行环境信息 (是否 Docker 环境), 再检测连接模式
+    await fetchEnvironmentInfo();
+
+    // 检测连接模式
+    currentMode = detectConnectionMode();
+    updateConnectionModeIndicator();
+
+    // WebSerial 桥接按钮显示逻辑:
+    //   - Docker 环境: 始终显示 (唯一连接方式)
+    //   - 非 Docker 环境: 始终显示 (可选切换到 WebSerial 模式)
+    const wsBtn = document.getElementById('btnWebSerialBridge');
+    if (wsBtn) {
+        wsBtn.style.display = 'flex';
+
+        if (isDockerEnv) {
+            // Docker 环境: 更新按钮文字和提示
+            wsBtn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7h2l-4-4-4 4h2v8.2A3 3 0 0 0 9 18v1a3 3 0 1 0 3-3 3 3 0 0 0 1 .2V9.8l3 2.2a3 3 0 1 0 1.2-1.6L15 8.8V7Z"/></svg>连接设备`;
+            showToast('Docker 环境：仅支持 WebSerial 桥接，请点击「连接设备」通过浏览器连接 USB 设备', 'info', 5000);
+        } else {
+            // 非 Docker 环境: 按钮文字保持默认 "WebSerial模式"
+            showToast('可使用后端直连或 WebSerial 桥接（二选一）', 'info', 3000);
+        }
+    }
 });
 
 // ==================== 导航切换 ====================
@@ -278,7 +717,7 @@ function renderDeviceList() {
                     </div>
                 </td>
                 <td class="no-cell">
-                    <code class="no-phone">${deviceLabel}</code>${noCardBadge}
+                    <code class="no-phone">${escapeHtml(deviceLabel)}</code>${noCardBadge}${device.connection_type === 'webserial' ? '<span class="ml-1 px-1 py-0.5 text-[9px] bg-amber-900/50 text-amber-400 rounded font-mono" title="WebSerial 桥接模式">WS</span>' : ''}
                     <button class="btn-action btn-danger" onclick="removeDevice('${deviceId}')" title="移除"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg></button>
                 </td>
                 <td class="model-cell">
@@ -1025,11 +1464,6 @@ function updateCharCount() {
     document.getElementById('smsCharCount').textContent = len;
 }
 
-function onPhoneFocus(input) {
-    // 如果选择了某个会话，不覆盖
-    if (currentConversationPhone) return;
-}
-
 // 搜索过滤会话
 function filterConversations() {
     const keyword = document.getElementById('smsSearchInput').value.toLowerCase();
@@ -1293,18 +1727,6 @@ function showCallConversation(phone) {
 }
 
 // 过滤通话记录（兼容旧调用，现已由 renderCallRecordList 的视图模式取代）
-function filterCallRecords(type) {
-    const items = document.querySelectorAll('.call-record-item');
-    
-    items.forEach(item => {
-        if (type === 'all') {
-            item.style.display = '';
-        } else {
-            item.style.display = item.classList.contains(type) ? '' : 'none';
-        }
-    });
-}
-
 // 拨号盘
 function dialKey(key) {
     const display = document.getElementById('dialDisplay');
@@ -1408,9 +1830,9 @@ function addCallRecord(simKey, phone, type, duration = null) {
     }
     
     AppState.callRecords[simKey].push({
-        id: `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        id: `call_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`,
         time: new Date().toISOString(),
-        phone,
+        peer_phone: phone,
         type,
         duration,
         status: type === 'missed' ? '未接通' : '已完成'
@@ -1425,7 +1847,8 @@ function handleCallEvent(data) {
         addCallRecord(simKey, data.phone || data.from, 'incoming');
         showToast(`来电: ${formatPhoneDisplay(data.phone || data.from)}`, 'warning');
     } else if (data.event === 'call_disconnected') {
-        addCallRecord(simKey, data.phone, 'outgoing', data.duration);
+        const type = data.direction === 'out' ? 'outgoing' : 'incoming';
+        addCallRecord(simKey, data.phone, type, data.duration);
     }
     
     if (AppState.selectedDevice === simKey) {
@@ -1719,16 +2142,29 @@ function showToast(message, type = 'info', duration = 3000) {
     toast.className = `toast toast-${type}`;
     toast.innerHTML = `
         <span class="toast-icon">${ICONS[type] || ICONS.info}</span>
-        <span class="toast-message">${message}</span>
+        <span class="toast-message">${escapeHtml(message)}</span>
     `;
-    
+
     container.appendChild(toast);
-    
+
     // 触发动画
     requestAnimationFrame(() => toast.classList.add('show'));
-    
+
     setTimeout(() => {
         toast.classList.remove('show');
         setTimeout(() => toast.remove(), 300);
     }, duration);
 }
+
+// 页面关闭时断开 WebSerial 桥接连接
+window.addEventListener('beforeunload', async () => {
+    if (isWebSerialBridgeReading) {
+        isWebSerialBridgeReading = false;
+        if (webSerialBridgeReader) {
+            try { webSerialBridgeReader.cancel(); } catch (e) {}
+        }
+        if (webSerialBridgePort && webSerialBridgePort.readable) {
+            try { await webSerialBridgePort.close(); } catch (e) {}
+        }
+    }
+});
