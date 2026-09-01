@@ -58,6 +58,7 @@ async function fetchEnvironmentInfo() {
         if (resp.ok) {
             const data = await resp.json();
             isDockerEnv = !!data.is_docker;
+            authRequired = !!data.auth_required;
         }
     } catch (e) {
         console.warn('获取环境信息失败:', e);
@@ -442,9 +443,69 @@ async function toggleWebSerialBridge() {
     }
 }
 
+// ==================== 事件委托 ====================
+// 背景: 列表(设备/会话/通话)会频繁重渲染, 且其内容(对方号码、设备标识)来自蜂窝网,
+// 属于不可信输入。此前使用内联 onclick="fn('${escapeHtml(x)}')" 拼接, 而 escapeHtml
+// 不编码单双引号, 可被形如 "x')+alert(1)+('" 的号码突破, 构成存储型 XSS。
+// 改为 data-* 属性 + 事件委托后, 取值走 dataset (不经过 HTML 解析器), 结构性免疫;
+// 且只需在初始化时绑定一次, 列表重渲染后无需重新绑定。
+function initEventDelegation() {
+    // 设备列表: 移除 / 编辑备注 / 跳转发短信 / 跳转拨号
+    const deviceBody = document.getElementById('deviceListBody');
+    if (deviceBody) {
+        deviceBody.addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-action][data-device-id]');
+            if (!btn) return;
+            const deviceId = btn.dataset.deviceId;
+            switch (btn.dataset.action) {
+                case 'remove-device': removeDevice(deviceId); break;
+                case 'edit-remark': showRemarkDialog(deviceId); break;
+                case 'goto-sms': gotoSMS(deviceId); break;
+                case 'goto-call': gotoCall(deviceId); break;
+            }
+        });
+    }
+
+    // 短信会话列表
+    const convList = document.getElementById('smsConversationList');
+    if (convList) {
+        convList.addEventListener('click', (e) => {
+            const item = e.target.closest('[data-action="select-conversation"]');
+            if (item) selectConversation(item.dataset.phone);
+        });
+    }
+
+    // 通话记录列表: 聚合项按号码展开会话, 扁平项按记录 id 展开详情
+    const callList = document.getElementById('callRecordList');
+    if (callList) {
+        callList.addEventListener('click', (e) => {
+            const item = e.target.closest('[data-action]');
+            if (!item) return;
+            if (item.dataset.action === 'show-call-conversation') {
+                showCallConversation(item.dataset.phone);
+            } else if (item.dataset.action === 'show-call-detail') {
+                showCallDetail(Number(item.dataset.recordId));
+            }
+        });
+    }
+
+    // 通话详情区: 回拨 / 发短信
+    const callArea = document.getElementById('callRecordsArea');
+    if (callArea) {
+        callArea.addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-action][data-phone]');
+            if (!btn) return;
+            const phone = btn.dataset.phone;
+            if (btn.dataset.action === 'callback') callback(phone);
+            else if (btn.dataset.action === 'send-sms') sendSMSCall(phone);
+        });
+    }
+}
+
 // ==================== 初始化 ====================
 document.addEventListener('DOMContentLoaded', async () => {
     initNavigation();
+    initEventDelegation();
     initWebSocket();
     loadDevices();
     startPolling();
@@ -531,8 +592,14 @@ function initWebSocket() {
         }
     };
     
-    AppState.ws.onclose = () => {
+    AppState.ws.onclose = (event) => {
         updateConnectionStatus(false);
+        // 1008 = 服务端拒绝握手 (未登录或跨源), 提示登录而非静默重连
+        if (event.code === 1008) {
+            showToast('未授权，请输入访问口令', 'error');
+            showLoginModal();
+            return;
+        }
         showToast('连接已断开', 'warning');
         setTimeout(initWebSocket, 3000); // 自动重连
     };
@@ -551,10 +618,70 @@ function updateConnectionStatus(connected) {
     text.textContent = connected ? '在线' : '离线';
 }
 
+// ==================== 访问控制 (可选共享口令) ====================
+// 后端在配置 OMNISMS_PASSWORD 后启用共享口令; 未启用时 /api/env 返回 auth_required=false,
+// 前端行为完全不变。收到 401 时弹出登录框, 登录成功(会话 Cookie 下发)后重连并刷新。
+let authRequired = false;
+
+function showLoginModal() {
+    const modal = document.getElementById('loginModal');
+    if (!modal) return;
+    modal.classList.remove('hidden');
+    modal.classList.add('flex');
+    const input = document.getElementById('loginPassword');
+    if (input) {
+        input.value = '';
+        setTimeout(() => input.focus(), 50);
+    }
+}
+
+function hideLoginModal() {
+    const modal = document.getElementById('loginModal');
+    if (!modal) return;
+    modal.classList.add('hidden');
+    modal.classList.remove('flex');
+}
+
+async function submitLogin() {
+    const input = document.getElementById('loginPassword');
+    const err = document.getElementById('loginError');
+    if (!input) return;
+    if (err) err.textContent = '';
+    try {
+        const res = await fetch('/api/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password: input.value })
+        });
+        const data = await res.json();
+        if (data && data.success) {
+            hideLoginModal();
+            showToast('登录成功', 'success');
+            // 会话 Cookie 已下发: 重连 WebSocket 并重新拉取数据
+            if (AppState.ws) {
+                AppState.ws.onclose = null;   // 避免触发旧实例的重连逻辑
+                AppState.ws.close();
+            }
+            initWebSocket();
+            loadDevices();
+            syncScanStatus();
+            return;
+        }
+        if (err) err.textContent = (data && data.message) || '登录失败';
+    } catch (e) {
+        console.error('login error:', e);
+        if (err) err.textContent = '登录请求失败';
+    }
+}
+
 // ==================== API 调用封装 ====================
 async function apiGet(url) {
     try {
         const res = await fetch(url);
+        if (res.status === 401) {
+            showLoginModal();
+            return null;
+        }
         return await res.json();
     } catch (e) {
         console.error('API GET error:', url, e);
@@ -569,6 +696,15 @@ async function apiPost(url, body) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
         });
+        if (res.status === 401) {
+            showLoginModal();
+            return null;
+        }
+        if (res.status === 429) {
+            const data = await res.json().catch(() => ({}));
+            showToast(data.message || '操作过于频繁，请稍后再试', 'error');
+            return null;
+        }
         return await res.json();
     } catch (e) {
         console.error('API POST error:', url, e);
@@ -708,32 +844,34 @@ function renderDeviceList() {
             ? '<span class="no-card-badge" title="设备已连接但无 SIM 卡, 短信与通话功能不可用">无卡</span>'
             : '';
         
+        // 事件绑定统一走 data-* + 事件委托 (见 initEventDelegation), 不使用内联 onclick:
+        // 设备标识来自蜂窝网/固件上报, 属于不可信输入, 内联拼接会导致存储型 XSS。
         html += `
-            <tr data-device-id="${deviceId}">
+            <tr data-device-id="${escapeHtml(deviceId)}">
                 <td>
                     <div class="signal-cell">
                         ${deviceCarrierBadge(device)}
-                        <span class="signal-hover-target" data-device-id="${deviceId}" tabindex="0" title="悬停查看设备详情">${renderSignalCell(device)}</span>
+                        <span class="signal-hover-target" data-device-id="${escapeHtml(deviceId)}" tabindex="0" title="悬停查看设备详情">${renderSignalCell(device)}</span>
                     </div>
                 </td>
                 <td class="no-cell">
                     <code class="no-phone">${escapeHtml(deviceLabel)}</code>${noCardBadge}${device.connection_type === 'webserial' ? '<span class="ml-1 px-1 py-0.5 text-[9px] bg-amber-900/50 text-amber-400 rounded font-mono" title="WebSerial 桥接模式">WS</span>' : ''}
-                    <button class="btn-action btn-danger" onclick="removeDevice('${deviceId}')" title="移除"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg></button>
+                    <button class="btn-action btn-danger" data-action="remove-device" data-device-id="${escapeHtml(deviceId)}" title="移除"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg></button>
                 </td>
                 <td class="model-cell">
-                    <span class="model-value">${device.model || '-'}</span>
+                    <span class="model-value">${escapeHtml(device.model) || '-'}</span>
                 </td>
                 <td>
                     ${remark 
                         ? `<span class="device-remark">${escapeHtml(remark)}</span>` 
                         : '<span class="no-remark">-- 未设置 --</span>'}
-                    <button class="btn-icon-sm" onclick="showRemarkDialog('${deviceId}')" title="编辑备注"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg></button>
+                    <button class="btn-icon-sm" data-action="edit-remark" data-device-id="${escapeHtml(deviceId)}" title="编辑备注"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg></button>
                 </td>
-                <td><code>${device.port || '-'}</code></td>
+                <td><code>${escapeHtml(device.port) || '-'}</code></td>
                 <td>${lastActive}</td>
                 <td class="action-cell">
-                    <button class="btn-action btn-goto-sms" onclick="gotoSMS('${deviceId}')" title="发短信"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/></svg></button>
-                    <button class="btn-action btn-goto-call" onclick="gotoCall('${deviceId}')" title="打电话"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"/></svg></button>
+                    <button class="btn-action btn-goto-sms" data-action="goto-sms" data-device-id="${escapeHtml(deviceId)}" title="发短信"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/></svg></button>
+                    <button class="btn-action btn-goto-call" data-action="goto-call" data-device-id="${escapeHtml(deviceId)}" title="打电话"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"/></svg></button>
                 </td>
             </tr>`;
     });
@@ -1176,7 +1314,7 @@ function renderConversationList(simKey) {
         const countBadge = conv.count > 1 ? `<span class="conv-count">${conv.count}</span>` : '';
         
         html += `
-            <div class="conversation-item ${isActive ? 'active' : ''}" data-phone="${escapeHtml(phone)}" onclick="selectConversation('${escapeHtml(phone)}')">
+            <div class="conversation-item ${isActive ? 'active' : ''}" data-phone="${escapeHtml(phone)}" data-action="select-conversation">
                 <div class="conv-row">
                     <div class="conv-phone">${escapeHtml(displayPhone)}</div>
                     <div class="conv-time">${conv.last_time ? formatTimeShort(new Date(conv.last_time)) : ''}</div>
@@ -1255,12 +1393,15 @@ function renderChatMessages(phone) {
         const isSent = msg.direction === 'sent';
         const senderName = isSent ? '我' : formatPhoneDisplay(phone);
         const avatar = isSent ? '我' : (String(phone).slice(-4) || '?');
-        const statusMark = isSent ? (msg.status === 'delivered' ? '✓✓' :
-            msg.status === 'failed' ? '✕' : msg.status === 'pending' ? '…' : '✓') : '';
+        // 外发短信状态标记: pending=已下发命令(…) / accepted=已提交网络(✓) /
+        // sent|delivered=已送达(✓✓) / failed=失败(✕)
+        const statusMark = isSent ? (msg.status === 'failed' ? '✕'
+            : msg.status === 'pending' ? '…'
+            : msg.status === 'accepted' ? '✓' : '✓✓') : '';
         
         html += `
             <div class="message-row ${isSent ? 'sent' : 'received'}">
-                <div class="msg-avatar ${isSent ? 'me' : ''}" title="${senderName}">${escapeHtml(avatar)}</div>
+                <div class="msg-avatar ${isSent ? 'me' : ''}" title="${escapeHtml(senderName)}">${escapeHtml(avatar)}</div>
                 <div class="msg-col">
                     <div class="msg-sender">${escapeHtml(senderName)}</div>
                     <div class="chat-bubble">
@@ -1400,8 +1541,9 @@ function handleSMSEvent(data) {
         }
     } else if (data.event === 'sms_sent_result') {
         const simKey = data.device_id || AppState.selectedDevice;
-        const status = data.status === 'accepted' ? 'pending' :
-                       data.status === 'fail' ? 'failed' : data.status;
+        // 'accepted' 是中间态: 固件协议栈已接受并提交至网络, 后续由后端看门狗收敛为 sent。
+        // 此前把 accepted 降级为 pending, 导致气泡一直显示"发送中"。
+        const status = data.status === 'fail' ? 'failed' : (data.status || 'pending');
         const messages = AppState.smsMessages[simKey] || [];
         let updatedPhone = null;
         messages.forEach(m => {
@@ -1420,7 +1562,7 @@ function handleSMSEvent(data) {
         if (status === 'failed') {
             const reason = data.reason || `错误码: ${data.error_code ?? '未知'}`;
             showToast(`短信发送失败（${reason}）`, 'error');
-        } else if (status === 'pending') {
+        } else if (status === 'accepted') {
             showToast('设备已接受短信发送请求，等待运营商处理', 'info');
         }
     }
@@ -1593,7 +1735,7 @@ function renderCallRecordList(simKey) {
             const isActive = phone === AppState.selectedCallPhone;
             
             html += `
-                <div class="call-record-item call-conv-item ${typeClass} ${isActive ? 'active' : ''}" data-phone="${escapeHtml(phone)}" onclick="showCallConversation('${escapeHtml(phone)}')">
+                <div class="call-record-item call-conv-item ${typeClass} ${isActive ? 'active' : ''}" data-phone="${escapeHtml(phone)}" data-action="show-call-conversation">
                     <div class="call-type-icon">${typeIcon}</div>
                     <div class="call-info">
                         <div class="call-phone">${escapeHtml(displayPhone)}</div>
@@ -1629,7 +1771,7 @@ function renderCallRecordList(simKey) {
         const duration = record.duration ? `${record.duration}秒` : '';
         
         html += `
-            <div class="call-record-item ${typeClass}" data-phone="${escapeHtml(normalizePhone(record.peer_phone || '未知号码'))}" onclick="showCallDetail('${record.id}')">
+            <div class="call-record-item ${typeClass}" data-phone="${escapeHtml(normalizePhone(record.peer_phone || '未知号码'))}" data-record-id="${record.id}" data-action="show-call-detail">
                 <div class="call-type-icon">${typeIcon}</div>
                 <div class="call-info">
                     <div class="call-phone">${escapeHtml(formatPhoneDisplay(record.peer_phone) || '未知号码')}</div>
@@ -1702,8 +1844,8 @@ function showCallConversation(phone) {
                 <div class="text-sm text-slate-500 mt-1">共 ${phoneRecords.length} 条通话记录（来电 / 去电 / 未接）</div>
             </div>
             <div class="flex gap-2 shrink-0">
-                <button class="px-3 py-1.5 bg-emerald-500 hover:bg-emerald-600 text-white rounded-lg text-sm font-medium transition-colors" onclick="callback('${escapeHtml(phone)}')">回拨</button>
-                <button class="px-3 py-1.5 bg-brand-500 hover:bg-brand-600 text-white rounded-lg text-sm font-medium transition-colors" onclick="sendSMSCall('${escapeHtml(phone)}')">发短信</button>
+                <button class="px-3 py-1.5 bg-emerald-500 hover:bg-emerald-600 text-white rounded-lg text-sm font-medium transition-colors" data-action="callback" data-phone="${escapeHtml(phone)}">回拨</button>
+                <button class="px-3 py-1.5 bg-brand-500 hover:bg-brand-600 text-white rounded-lg text-sm font-medium transition-colors" data-action="send-sms" data-phone="${escapeHtml(phone)}">发短信</button>
             </div>
         </div>`;
 
@@ -2057,10 +2199,18 @@ function formatPhoneDisplay(raw) {
     return key;
 }
 
+// HTML 转义: 同时覆盖文本上下文 (& < >) 与属性上下文 (' " `)。
+// 说明: textContent -> innerHTML 的序列化只编码 & < >, 单双引号原样保留;
+// 早期代码把结果拼进 onclick="fn('${escapeHtml(x)}')" 这类 JS 属性上下文,
+// 可被形如 "x')+alert(1)+('" 的号码突破。现已全面改为事件委托(取值走 dataset, 不经过
+// HTML 解析器), 此处补齐引号编码作为纵深防御。
+const HTML_ESCAPE_MAP = {
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '`': '&#96;'
+};
+
 function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+    if (text === null || text === undefined) return '';
+    return String(text).replace(/[&<>"'`]/g, (ch) => HTML_ESCAPE_MAP[ch]);
 }
 
 function truncate(text, length) {

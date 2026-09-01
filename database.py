@@ -25,6 +25,34 @@ def utc_timestamp() -> str:
     return datetime.now(UTC_TZ).isoformat(timespec="seconds")
 
 
+# ==================== 不可信输入清洗 ====================
+# 对方号码(peer_phone)来自蜂窝网, 属于不可信输入: SMS 支持字母数字主叫地址,
+# 攻击者只需向该号码发一条短信即可注入任意字符串, 进而威胁下游前端渲染(存储型 XSS)。
+# 入库前统一收敛为标准号码形态; 非标准号码剥离危险字符后截断保留, 不做静默丢弃。
+
+# 标准号码: 可选 '+' 前缀 + 5~20 位纯数字 (覆盖国内手机号/固话/短号与国际号码)
+PEER_PHONE_RE = re.compile(r"^\+?[0-9]{5,20}$")
+# 非标准号码需剔除的字符: 控制字符 + HTML/JS 上下文元字符
+UNSAFE_PHONE_CHARS_RE = re.compile(r"[\x00-\x1f\x7f<>\"'`\\{}()\[\]]")
+PEER_PHONE_MAX_LEN = 64
+
+
+def sanitize_peer_phone(raw) -> str:
+    """清洗对方号码: 标准号码原样返回; 非标准号码剥离危险字符并截断。
+
+    不做静默丢弃 —— 宁可保留清洗后的可读形式, 也要避免短信/通话记录凭空消失。
+    """
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return s
+    if PEER_PHONE_RE.match(s):
+        return s
+    cleaned = UNSAFE_PHONE_CHARS_RE.sub("", s)
+    return cleaned[:PEER_PHONE_MAX_LEN]
+
+
 # ==================== 号码标准化 ====================
 # 后端仅保留 normalize_phone(), 用于 purge 时按归一化键匹配同一联系人的多种原始号码形态。
 # 注意: 入库存储一律原样保留 peer_phone(含原始国家码, 不做剥离), 数据完整性由后端保证;
@@ -335,12 +363,49 @@ class Database:
             finally:
                 conn.close()
 
+    def migrate_device_records(self, old_id: str, new_id: str) -> Dict[str, int]:
+        """设备标识迁移时, 同步搬迁该设备的历史短信与通话记录。
+
+        场景: 设备启动初期只能以 IMEI 兜底注册, 等号码/IMSI 上报后 device_id 会升级为
+        更优标识。若不迁移, 该设备此前收发的短信与通话会因 device_id 失配而"消失"
+        (所有查询都按 device_id 过滤), 变成无法检索的孤儿记录。
+
+        注意: 本方法只搬迁 sms_messages / call_records 的 device_id,
+        不处理 devices 表本身 (由调用方负责删除旧行并写入新行)。
+
+        @return: 各表受影响行数 {"sms": n, "calls": n}
+        """
+        if not old_id or not new_id or old_id == new_id:
+            return {"sms": 0, "calls": 0}
+        result = {"sms": 0, "calls": 0}
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                cur = conn.execute(
+                    "UPDATE sms_messages SET device_id = ? WHERE device_id = ?",
+                    (new_id, old_id)
+                )
+                result["sms"] = cur.rowcount or 0
+                cur = conn.execute(
+                    "UPDATE call_records SET device_id = ? WHERE device_id = ?",
+                    (new_id, old_id)
+                )
+                result["calls"] = cur.rowcount or 0
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                raise RuntimeError(f"迁移设备历史记录失败: {e}")
+            finally:
+                conn.close()
+        return result
+
     # ==================== 短信 ====================
 
     def add_sms(self, device_id: str, peer_phone: str, text: str, direction: str,
                 status: str = "pending", task_id: Optional[str] = None,
                 timestamp: Optional[str] = None) -> int:
-        # 原样存储对方号码, 不做归一化/剥离国家码, 保证后端数据完整性
+        # 号码清洗: 拦截蜂窝网侧注入的异常主叫地址(保留原始国家码, 不做归一化/剥离)
+        peer_phone = sanitize_peer_phone(peer_phone)
         now = utc_timestamp()
         ts = timestamp or now
         with self._lock:
@@ -539,7 +604,8 @@ class Database:
 
     def add_call(self, device_id: str, peer_phone: str, direction: str,
                  status: str = "unknown", start_time: Optional[str] = None) -> int:
-        # 原样存储对方号码, 不做归一化/剥离国家码, 保证后端数据完整性
+        # 号码清洗: 拦截蜂窝网侧注入的异常主叫地址(保留原始国家码, 不做归一化/剥离)
+        peer_phone = sanitize_peer_phone(peer_phone)
         now = utc_timestamp()
         st = start_time or now
         with self._lock:

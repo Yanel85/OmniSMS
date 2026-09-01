@@ -105,18 +105,39 @@ do_run() {
         fi
     done
     
+    # 访问口令 (可选)
+    # Docker 模式通过 -p 将端口发布到宿主机的 0.0.0.0, 即整个局域网可达。
+    # 短信/通话是会产生资费的外发能力, 强烈建议设置一个访问口令。
+    local pwd_args=()
+    if [ -n "${OMNISMS_PASSWORD}" ]; then
+        info "检测到环境变量 OMNISMS_PASSWORD, 启用访问口令"
+        pwd_args+=(-e "OMNISMS_PASSWORD=${OMNISMS_PASSWORD}")
+    else
+        warn "端口将发布到 0.0.0.0:${WEB_PORT} (局域网内可达)"
+        # 加 || true: 非交互执行(无 TTY)时 read 会返回非零, 在 set -e 下会直接中止脚本
+        read -p "设置访问口令 (强烈建议, 直接回车则免鉴权): " input_pwd || true
+        if [ -n "${input_pwd}" ]; then
+            pwd_args+=(-e "OMNISMS_PASSWORD=${input_pwd}")
+            info "✓ 已启用访问口令"
+        else
+            warn "⚠️  未设置口令: 局域网内任何人都可以发短信 / 拨号 / 查看全部短信"
+        fi
+    fi
+
     # 启动新容器
     info "启动容器: ${CONTAINER_NAME}"
     info "Docker 模式将自动启用 HTTPS"
-    
+
+    # 注: 不再使用 --privileged —— Docker 环境下 pySerial 被强制禁用,
+    # 设备通过浏览器 WebSerial 接入, 容器本身不需要任何宿主机设备访问权限。
     docker run -d \
         --name "${CONTAINER_NAME}" \
-        --privileged \
         --restart unless-stopped \
         -p "${WEB_PORT}:8000" \
         -v omnisms-logs:/app/logs \
         -v omnisms-db:/app/data \
         -e TZ=Asia/Shanghai \
+        ${pwd_args[@]+"${pwd_args[@]}"} \
         "${default_tag}"
     
     if [ $? -eq 0 ]; then

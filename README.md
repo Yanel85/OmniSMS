@@ -92,7 +92,9 @@ OmniSMS/
   - `_auto_scan_worker` / `_discover_devices`：后台持续按 VID/PID 列表（默认 `19d1:0001`，覆盖 Air780E/EG/EP/EH）扫描真实 USB 串口；`start_auto_scan()` / `stop_auto_scan()` 控制启停。设备系列由 `classify_series()` 依据固件 `model` 或 IMEI TAC 推断，业务零分支。
   - `_try_register_device`：发送 `identify` 握手 → 等待 `boot` 事件（超时 5s）→ 注册设备并启动读取线程。
   - `_reader_loop` / `_handle_incoming_message`：按行解析 JSON，分发上行事件。
-  - 下行接口：`send_sms()`（失败返回 `None`）、`make_call()`、`hangup_call()`，经 `_send_command()` 线程安全写入串口；同时支持 pyserial 直连与 WebSerial 虚拟端口两种连接类型。
+  - 下行接口：`send_sms()`（成功返回 `task_id`，失败返回 `None`）、`make_call()`（成功返回 `task_id`，失败返回 `None`）、`hangup_call()`，经 `_send_command()` 线程安全写入串口；同时支持 pyserial 直连与 WebSerial 虚拟端口两种连接类型。
+  - 短信终态收敛：`sms_sent_result` 的 `accepted` 只是中间态（协议栈已接受、已提交网络），固件不提供运营商投递回执，因此由看门狗 `_check_pending_sms_tasks()` 在 `SMS_ACCEPTED_TIMEOUT_SEC`（默认 120s）后收敛为 `sent`；命令下发后完全无响应则在 `SMS_PENDING_TIMEOUT_SEC`（默认 300s）后收敛为 `failed`。每条外发短信最终都会落到 `sent` / `failed`，不会永久停留在 `pending`。
+  - 设备标识迁移：`_migrate_device_id()` 在号码/IMSI 到位升级 `device_id` 时，会同步调用 `Database.migrate_device_records()` 搬迁历史短信与通话记录，避免旧记录因 `device_id` 失配变成孤儿数据。
   - `WebSerialVirtualPort`：WebSerial 桥接模式下模拟串口对象，供引擎读取线程复用同一套消息处理逻辑。
   - 通话状态：`active_calls` 记录 `(call_id, start_time, direction)`，挂断时计算真实通话时长并回传方向。
 - `event_callback`：供 Web 层推送实时事件到前端。
@@ -163,18 +165,55 @@ python3 -m venv .venv
 
 ### 正常启动（连接真实 Air780E）
 ```bash
-.venv/bin/python web.py --host 0.0.0.0 --port 8000
+.venv/bin/python web.py --port 8000
 ```
 - 引擎自动扫描 `/dev/ttyACM*`（VID/PID `19d1:0001`，覆盖 Air780E/EG/EP/EH）并注册设备。
-- 浏览器访问 `http://<host>:8000`。
+- 默认监听 `127.0.0.1`，浏览器访问 `http://localhost:8000`。
+- 需要局域网内其他机器访问时，加 `--host 0.0.0.0` 并**务必同时设置 `OMNISMS_PASSWORD`**。
 
 ### 命令行参数
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--host` | `0.0.0.0` | Web 监听地址 |
+| `--host` | `127.0.0.1` | Web 监听地址（默认仅本机；需局域网访问时设 `OMNISMS_HOST=0.0.0.0` 或显式传参） |
 | `--port` | `8000` | Web 监听端口 |
 | `--ssl-cert` | 无 | SSL 证书文件路径（启用 HTTPS） |
 | `--ssl-key` | 无 | SSL 私钥文件路径（启用 HTTPS） |
+
+### 环境变量
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `OMNISMS_HOST` | `127.0.0.1` | Web 监听地址。容器内必须绑定 `0.0.0.0`（Dockerfile CMD 已指定），是否暴露到局域网由 `docker run -p` 的宿主侧绑定决定 |
+| `OMNISMS_PASSWORD` | 空 | 访问口令。**为空（默认）时服务免鉴权**，适用于仅本机访问；设置后启用共享口令会话，用于保护暴露到局域网的端口 |
+| `OMNISMS_DISABLE_PYSERIAL` | 未设置 | 设为 `1` 强制禁用 pySerial 直连 |
+| `OMNISMS_FORCE_DOCKER` | 未设置 | 设为 `1` 强制按 Docker 环境处理（禁用 pySerial） |
+| `SSL_CERT_FILE` / `SSL_KEY_FILE` | 无 | HTTPS 证书与私钥路径 |
+
+### 访问控制
+
+本工具定位为**内网/本机单人使用**，**不提供多用户体系与角色权限**。是否启用鉴权取决于服务暴露范围：
+
+| 部署形态 | 建议 |
+|------|------|
+| 原生运行（默认 `127.0.0.1`） | 免鉴权即可。注意：WebSocket 不受浏览器同源策略约束，任意网页都能直连本机端口，因此服务端**始终**校验 `Origin` 同源；`/api/env` 也始终免鉴权 |
+| Docker 且仅本机访问（`-p 127.0.0.1:8000:8000`） | 免鉴权即可，端口不对外暴露 |
+| Docker 暴露到局域网（`-p 8000:8000`，`build.sh run` 默认） | **必须设置 `OMNISMS_PASSWORD`**。短信/通话是会产生资费的外发能力，被滥用（轰炸/诈骗）可能导致 SIM 卡被运营商关停 |
+
+启用口令后的行为：
+- 未登录访问任意 REST 接口返回 `401`，前端自动弹出登录框。
+- 登录后下发 `HttpOnly; SameSite=Strict` 会话 Cookie（HTTPS 下额外带 `Secure`）；同源 WebSocket 握手会自动携带该 Cookie，因此 REST 与 WebSocket 共用一套鉴权，令牌不出现在 URL 中。
+- WebSocket 未通过校验时以 `1008` 拒绝握手；`/api/env` 与 `/static` 保持免鉴权。
+- 会话仅存于内存，进程重启后需重新登录。
+
+### 发送速率限制
+
+独立于鉴权之外的兜底措施，即使环境完全可信也会生效（可挡住前端轮询缺陷或脚本失控导致的批量外发）：
+
+| 接口 | 限速 |
+|------|------|
+| `POST /api/sms/send` | 每设备 20 条/分钟（突发 10 条） |
+| `POST /api/call/dial` | 每设备 3 次/分钟 |
+
+超限返回 `429`。
 
 ### HTTPS 访问
 
@@ -258,7 +297,8 @@ docker run -d \
 > - 容器内服务监听 `8000` 端口，映射到宿主机 `8000` 端口，访问地址为 `https://localhost:8000`。
 > - 首次访问会因自签名证书触发浏览器安全提示，点击「高级」→「继续前往」即可。
 > - 数据持久化在 `omnisms-logs`（日志）与 `omnisms-db`（SQLite 数据库）两个 Docker 卷中。
-> - 设备接入依赖浏览器 WebSerial API（需 Chromium 内核浏览器），无需在容器内挂载 USB 设备。
+> - 设备接入依赖浏览器 WebSerial API（需 Chromium 内核浏览器），无需在容器内挂载 USB 设备（因此容器不再使用 `--privileged`）。
+> - **安全**：`-p 8000:8000` 会把端口发布到宿主机的 `0.0.0.0`，即**整个局域网可达**。`build.sh run` 会交互式询问访问口令，也可提前设置 `OMNISMS_PASSWORD=xxx ./build.sh run`。若只需本机访问，改用 `-p 127.0.0.1:8000:8000` 即可完全不暴露。
 
 ---
 
@@ -267,25 +307,27 @@ docker run -d \
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/` | 主页面 |
-| GET | `/api/env` | 运行环境信息 `{is_docker, pyserial_disabled}`（前端据此决定连接模式） |
+| GET | `/api/env` | 运行环境信息 `{is_docker, pyserial_disabled, auth_required}`（前端据此决定连接模式与是否弹登录框；始终免鉴权） |
+| POST | `/api/login` | 共享口令登录 `{password}`，成功后下发 HttpOnly 会话 Cookie；未启用口令时返回 `required=false` |
+| POST | `/api/logout` | 注销当前会话 |
 | GET | `/api/devices` | 设备列表（在线 + 数据库离线/备注合并） |
 | GET | `/api/devices/{device_id}` | 单设备详情（`device_id` = 本机号码或 IMEI 兜底） |
 | POST | `/api/disconnect` | 删除设备：从引擎内存移除并断开连接，同时从数据库彻底删除 `{device_id}` |
 | POST | `/api/devices/remark` | 保存设备备注 `{device_id, remark}` |
-| GET | `/api/scan` | 手动扫描：对每个端口独立探测，每个端口最多等待 `duration` 秒（默认 15） |
+| POST | `/api/scan` | 手动扫描：对每个端口独立探测，每个端口最多等待 `duration` 秒（默认 15） |
 | POST | `/api/scan/auto/start` | 启动后台自动扫描（引擎启动时已默认开启） |
 | POST | `/api/scan/auto/stop` | 停止后台自动扫描（不影响已注册设备） |
 | POST | `/api/scan/stop` | 提前停止正在进行的手动扫描 |
 | GET | `/api/scan/status` | 查询扫描状态（`scanning` / `auto_scanning`） |
-| POST | `/api/sms/send` | 发送短信 `{device_id, phone, text}`（下发失败返回 `502`） |
+| POST | `/api/sms/send` | 发送短信 `{device_id, phone, text}`（下发失败返回 `502`；超出限速返回 `429`） |
 | GET | `/api/sms/conversations?device_id=` | 短信记录（扁平，peer_phone 原样返回；聚合与展示由前端完成） |
 | GET | `/api/sms/messages?device_id=&peer_phone=` | 某原始号码的全部消息（精确匹配） |
 | POST | `/api/sms/purge` | 清空指定号码短信记录 `{device_id?, phone, confirm, dry_run}`（需 `confirm=true`，含事务回滚） |
 | GET | `/api/calls?device_id=` | 通话记录（扁平，peer_phone 原样返回；聚合与展示由前端完成） |
 | GET | `/api/calls/conversations?device_id=` | 通话记录（扁平，同 `/api/calls`） |
-| POST | `/api/call/dial`（`/api/call/make`） | 拨号 `{device_id, phone}` |
+| POST | `/api/call/dial`（`/api/call/make`） | 拨号 `{device_id, phone}`，返回 `{success, task_id, message}`；超出限速返回 `429` |
 | POST | `/api/call/hangup` | 挂断 `{device_id}` |
-| GET | `/api/logs` | 历史日志（过滤/分页） |
+| GET | `/api/logs` | 历史日志（过滤/分页）。单次扫描同时返回 `total` 与 `total_exact`；`total_exact=false` 时 `total` 为下界，应显示为「≥ N」 |
 | GET | `/api/logs/cache` | 最近日志缓存 |
 | GET | `/api/logs/files` | 日志文件列表 |
 | POST | `/api/logs/clear-cache` | 清空内存日志缓存 |

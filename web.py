@@ -9,11 +9,12 @@ import logging
 import os
 import re
 import asyncio
+import secrets
 import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from itertools import islice
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query, Request
@@ -21,6 +22,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
 import uvicorn
 
 # 导入核心引擎
@@ -28,7 +30,10 @@ from omnisms import OmniSMSEngine, Config, setup_logging, WebSerialVirtualPort, 
 from database import Database
 
 # ==================== 配置 ====================
-WEB_HOST = "0.0.0.0"
+# 默认仅监听本机回环地址 (本地工具定位); 需要局域网访问时设置 OMNISMS_HOST=0.0.0.0。
+# 注意: Docker 模式容器内必须绑定 0.0.0.0 (Dockerfile CMD 已指定),
+#       是否暴露到局域网由 `docker run -p` 的宿主侧绑定决定。
+WEB_HOST = os.environ.get("OMNISMS_HOST", "127.0.0.1")
 WEB_PORT = 8000
 LOG_DIR = "logs"                              # 日志文件目录 (与 omnisms.py 共享)
 LOG_FILE = "logs/omnisms.log"                 # 当前日志文件 (按天轮转)
@@ -85,6 +90,49 @@ def is_docker_environment() -> bool:
         pass
     return False
 
+
+# ==================== 发送速率限制 ====================
+# 短信/通话是"出向外发"能力: 会产生资费, 被滥用(轰炸/诈骗)还可能导致 SIM 卡被运营商关停。
+# 因此限流独立于鉴权之外作为兜底 —— 即使环境完全可信, 也能挡住前端轮询 bug 或脚本失控的批量外发。
+class TokenBucket:
+    """简单令牌桶: 按恒定速率补充令牌, 桶空即拒绝。线程安全。"""
+
+    def __init__(self, rate: float, capacity: float):
+        self.rate = rate              # 每秒补充的令牌数
+        self.capacity = capacity      # 桶容量 (允许的突发量)
+        self.tokens = capacity
+        self.updated_at = time.monotonic()
+        self.lock = threading.Lock()
+
+    def allow(self, n: float = 1.0) -> bool:
+        with self.lock:
+            now = time.monotonic()
+            self.tokens = min(self.capacity, self.tokens + (now - self.updated_at) * self.rate)
+            self.updated_at = now
+            if self.tokens >= n:
+                self.tokens -= n
+                return True
+            return False
+
+
+# 每设备独立的限流桶 (懒创建)
+SMS_RATE_BUCKETS: Dict[str, TokenBucket] = {}
+DIAL_RATE_BUCKETS: Dict[str, TokenBucket] = {}
+
+SMS_RATE_PER_MIN = 20    # 短信: 每设备 20 条/分钟
+DIAL_RATE_PER_MIN = 3    # 拨号: 每设备 3 次/分钟
+
+
+def _rate_bucket(store: Dict[str, TokenBucket], key: str,
+                 rate: float, capacity: float) -> TokenBucket:
+    """获取(必要时创建)指定 key 的限流桶。"""
+    bucket = store.get(key)
+    if bucket is None:
+        bucket = TokenBucket(rate=rate, capacity=capacity)
+        store[key] = bucket
+    return bucket
+
+
 # 全局引擎实例
 engine: Optional[OmniSMSEngine] = None
 
@@ -96,6 +144,61 @@ LOOP = None
 
 # 是否运行在 Docker 容器内 (Docker 环境仅支持 WebSerial 桥接, 禁用 pySerial)
 IS_DOCKER = is_docker_environment()
+
+
+# ==================== 访问控制 (可选共享口令) ====================
+# 定位: 内网/本机的单人工具, 不做多用户体系与角色权限。
+# 设计: 未设置 OMNISMS_PASSWORD 时守卫整体关闭, 保持单机 127.0.0.1 场景零摩擦;
+#       设置后启用基于 Cookie 的共享口令会话 —— Cookie 会被同源 WebSocket 握手自动携带,
+#       因此一套机制同时覆盖 REST 与 WebSocket, 无需把令牌放进 URL (避免被日志/代理记录)。
+# 典型场景: Docker 模式通过 `docker run -p` 将端口暴露到局域网时设置一个强口令。
+APP_PASSWORD = os.environ.get("OMNISMS_PASSWORD", "").strip()
+SESSION_COOKIE = "omnisms_session"
+# 内存会话表: 仅保存已签发的会话令牌, 进程重启即失效 (本地工具无需持久化)
+SESSIONS: set = set()
+
+# 无需登录即可访问的路径 / 前缀 (登录接口本身、静态资源、环境探测)
+AUTH_PUBLIC_PATHS = {"/", "/api/login", "/api/env"}
+AUTH_PUBLIC_PREFIXES = ("/static",)
+
+
+class LocalSessionMiddleware(BaseHTTPMiddleware):
+    """可选的共享口令守卫: 仅当配置 OMNISMS_PASSWORD 时生效。
+
+    注意: Starlette 的 HTTP 中间件不覆盖 WebSocket scope,
+    因此 WebSocket 端点必须自行调用 ws_authorized() 校验 (见 /ws/log 与 /ws/webserial)。
+    """
+
+    async def dispatch(self, request, call_next):
+        if not APP_PASSWORD:
+            return await call_next(request)
+        path = request.url.path
+        if path in AUTH_PUBLIC_PATHS or path.startswith(AUTH_PUBLIC_PREFIXES):
+            return await call_next(request)
+        if request.cookies.get(SESSION_COOKIE) in SESSIONS:
+            return await call_next(request)
+        return JSONResponse(status_code=401, content={"detail": "unauthorized"})
+
+
+def ws_authorized(websocket: WebSocket) -> bool:
+    """WebSocket 端点准入校验: 同源 + (可选) 会话 Cookie, 必须在 accept() 之前调用。
+
+    - Origin 校验: WebSocket 不受浏览器同源策略约束, 任意网页都能直连本机端口,
+      因此必须显式拒绝跨源握手, 否则短信与日志会被任意恶意页面静默订阅。
+      非浏览器客户端(脚本/命令行)不发送 Origin, 予以放行。
+    - Cookie 校验: 仅在配置 APP_PASSWORD 时生效; 同源握手会自动携带 Cookie。
+    """
+    origin = websocket.headers.get("origin")
+    if origin is not None:
+        host = websocket.headers.get("host", "")
+        try:
+            if origin.split("//", 1)[-1].split("/")[0] != host:
+                return False
+        except IndexError:
+            return False
+    if APP_PASSWORD:
+        return websocket.cookies.get(SESSION_COOKIE) in SESSIONS
+    return True
 
 
 @asynccontextmanager
@@ -118,6 +221,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
 
+# 可选共享口令守卫 (未配置 OMNISMS_PASSWORD 时中间件内部直接放行)
+app.add_middleware(LocalSessionMiddleware)
+
 # WebSocket 连接管理器
 class ConnectionManager:
     def __init__(self):
@@ -128,11 +234,20 @@ class ConnectionManager:
         self.active_connections.append(websocket)
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        # 容错: 连接可能已被剔除 (重复断开 / 未 connect 即关闭), 移除失败不应抛异常
+        try:
+            self.active_connections.remove(websocket)
+        except ValueError:
+            pass
 
     async def broadcast(self, message: dict):
+        # 逐连接隔离异常: 单个半开连接 send 失败不得中断其余客户端的推送。
+        # 此前一次异常就会让整个循环中断, 导致所有客户端静默收不到后续事件。
         for connection in list(self.active_connections):
-            await connection.send_json(message)
+            try:
+                await connection.send_json(message)
+            except Exception:
+                self.disconnect(connection)
 
 manager = ConnectionManager()
 
@@ -424,19 +539,48 @@ class LogFileReader:
             "module": m.group("logger"),
         }
 
+    @staticmethod
+    def _iter_lines_reversed(path: str, block_size: int = 65536):
+        """倒序产出文件的每一行, 不把整个文件读进内存。
+
+        采用从文件尾部按块回退读取的方式 (类似 tac): 每轮读取一个块并与上一轮遗留的片段
+        拼接, 按行切分后倒序产出; 每块中最靠前、可能不完整的那一段留到下一轮继续拼接。
+        这样即使单个日志文件有数百 MB, 内存占用也始终维持在块大小级别,
+        配合提前终止可以只读到所需位置就停下。
+        """
+        try:
+            with open(path, 'rb') as f:
+                f.seek(0, os.SEEK_END)
+                remaining = f.tell()
+                pending = b''          # 尚未确认完整的一行 (其开头位于更靠前的块中)
+                while remaining > 0:
+                    read_size = min(block_size, remaining)
+                    remaining -= read_size
+                    f.seek(remaining)
+                    buf = f.read(read_size) + pending
+                    parts = buf.split(b'\n')
+                    # parts[0] 可能不完整, 留作下一轮的 pending; 其余为本块的完整行
+                    pending = parts[0]
+                    for part in reversed(parts[1:]):
+                        yield part.decode('utf-8', errors='ignore') + '\n'
+                if pending:
+                    yield pending.decode('utf-8', errors='ignore')
+        except Exception:
+            return
+
     def _iter_records(self, level: Optional[str] = None, keyword: Optional[str] = None,
-                      start_time: Optional[str] = None, end_time: Optional[str] = None):
-        """生成器: 倒序产出符合条件的日志记录"""
+                      start_time: Optional[str] = None, end_time: Optional[str] = None,
+                      scan_budget: Optional[int] = None):
+        """生成器: 倒序产出符合条件的日志记录, 不会把整个日志文件读进内存。
+
+        @param scan_budget: 最多产出多少条匹配记录后提前终止; None 表示不限。
+                            分页场景应设为 offset+limit 级别, 避免全量扫描。
+        """
         level = level.upper() if level else None
         kw = keyword.lower() if keyword else None
+        produced = 0
         for path in self.list_files():
-            try:
-                with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                    lines = f.readlines()
-            except Exception:
-                continue
-            # 单文件内倒序读取
-            for raw in reversed(lines):
+            for raw in self._iter_lines_reversed(path):
                 entry = self.parse_line(raw)
                 if not entry:
                     continue
@@ -451,24 +595,34 @@ class LogFileReader:
                     if kw not in haystack:
                         continue
                 yield entry
+                produced += 1
+                if scan_budget is not None and produced >= scan_budget:
+                    return
 
     def get_logs(self, level=None, keyword=None, start_time=None, end_time=None,
-                 limit: int = 200, offset: int = 0):
-        it = self._iter_records(level, keyword, start_time, end_time)
-        # 跳过 offset 条后取 limit 条, 避免一次性物化全部记录
-        records = list(islice(it, offset, offset + limit))
-        # total 需单独统计 (生成器已消费, 重新迭代计数)
-        total = sum(1 for _ in self._iter_records(level, keyword, start_time, end_time))
-        return records, total
+                 limit: int = 200, offset: int = 0, scan_budget: Optional[int] = None):
+        """倒序分页读取日志。
+
+        单次扫描同时得到"当前页"与"总数": 最多只读取 offset+limit+1 条匹配记录。
+        若扫描在达到该上限前自然结束, 说明已遍历全部匹配记录, total 为精确值;
+        否则 total 为下界, 前端应显示为 "≥ N"。
+
+        此前实现会对全部日志做两遍完整扫描(取页一遍 + 统计 total 一遍), 且每遍都用
+        readlines() 把整个文件读进内存 —— 日志累积到几十 MB 时, 单次请求会读取数百 MB
+        并阻塞事件循环。
+
+        @return: (records, total, total_exact)
+        """
+        budget = scan_budget if scan_budget is not None else offset + limit + 1
+        window = list(self._iter_records(level, keyword, start_time, end_time,
+                                         scan_budget=budget))
+        records = window[offset:offset + limit]
+        # 未触顶 => len(window) 就是全部匹配数; 触顶 => 它是下界
+        return records, len(window), len(window) < budget
 
     def get_recent(self, limit: int = 200):
         """获取最近 N 条日志 (供前端启动时填充)"""
-        records = []
-        for entry in self._iter_records():
-            records.append(entry)
-            if len(records) >= limit:
-                break
-        return records
+        return list(self._iter_records(scan_budget=limit))
 
     def count(self) -> int:
         """统计所有日志行数 (近似, 用于前端显示总数)"""
@@ -495,11 +649,57 @@ async def get_env():
 
     - is_docker: 是否运行在 Docker 容器内 (Docker 环境仅支持 WebSerial 桥接)
     - pyserial_disabled: 后端是否已禁用 pySerial 直连
+    - auth_required: 是否启用共享口令 (前端据此决定是否弹出登录框)
     """
     return JSONResponse(content={
         "is_docker": IS_DOCKER,
         "pyserial_disabled": bool(engine and engine.config.DISABLE_PYSERIAL),
+        "auth_required": bool(APP_PASSWORD),
     })
+
+
+class LoginRequest(BaseModel):
+    password: str = ""
+
+
+@app.post("/api/login")
+async def login(request: Request, body: LoginRequest):
+    """共享口令登录, 成功后下发 HttpOnly 会话 Cookie。
+
+    未配置 OMNISMS_PASSWORD 时返回 required=False, 前端不显示登录框。
+    采用 compare_digest 做定长比较, 避免时序侧信道。
+    """
+    if not APP_PASSWORD:
+        return JSONResponse(content={"success": True, "required": False})
+
+    if not secrets.compare_digest(body.password or "", APP_PASSWORD):
+        return JSONResponse(status_code=401, content={
+            "success": False, "message": "口令错误"
+        })
+
+    token = secrets.token_urlsafe(32)
+    SESSIONS.add(token)
+    resp = JSONResponse(content={"success": True, "required": True})
+    resp.set_cookie(
+        SESSION_COOKIE, token,
+        httponly=True,
+        samesite="strict",
+        # Docker 模式已强制 HTTPS; 原生 HTTP 模式下自动关闭, 否则 Cookie 无法回传
+        secure=request.url.scheme == "https",
+        max_age=7 * 24 * 3600,
+    )
+    return resp
+
+
+@app.post("/api/logout")
+async def logout(request: Request):
+    """注销: 作废当前会话令牌并清除 Cookie"""
+    token = request.cookies.get(SESSION_COOKIE)
+    if token:
+        SESSIONS.discard(token)
+    resp = JSONResponse(content={"success": True})
+    resp.delete_cookie(SESSION_COOKIE)
+    return resp
 
 
 @app.get("/api/devices")
@@ -732,6 +932,14 @@ async def send_sms(request: SendSMSRequest):
             "message": "设备无卡，短信功能不可用"
         })
     
+    # 速率限制: 每设备 20 条/分钟 (突发 10 条), 防止脚本失控/前端 bug 批量外发
+    if not _rate_bucket(SMS_RATE_BUCKETS, request.device_id,
+                        rate=SMS_RATE_PER_MIN / 60, capacity=10).allow():
+        return JSONResponse(status_code=429, content={
+            "success": False,
+            "message": f"发送过于频繁，请稍后再试（限速 {SMS_RATE_PER_MIN} 条/分钟）"
+        })
+
     phone = normalize_outgoing_phone(request.phone)
     task_id = engine.send_sms(request.device_id, phone, request.text)
     if task_id is None:
@@ -853,15 +1061,27 @@ async def make_call(request: MakeCallRequest):
             "message": "设备无卡，通话功能不可用"
         })
     
+    # 速率限制: 每设备 3 次/分钟, 防止误触或脚本失控导致的连续外呼
+    if not _rate_bucket(DIAL_RATE_BUCKETS, request.device_id,
+                        rate=DIAL_RATE_PER_MIN / 60, capacity=DIAL_RATE_PER_MIN).allow():
+        return JSONResponse(status_code=429, content={
+            "success": False,
+            "message": f"拨号过于频繁，请稍后再试（限速 {DIAL_RATE_PER_MIN} 次/分钟）"
+        })
+
     phone = normalize_outgoing_phone(request.phone)
-    success = engine.make_call(request.device_id, phone)
-    if success:
+    # make_call 返回任务ID (成功) / None (设备离线或写入失败)
+    task_id = engine.make_call(request.device_id, phone)
+    if task_id:
         return JSONResponse(content={
             "success": True,
+            "task_id": task_id,
             "message": "拨号命令已下发"
         })
-    else:
-        raise HTTPException(status_code=500, detail="拨号失败")
+    return JSONResponse(status_code=400, content={
+        "success": False,
+        "message": "拨号失败：设备离线或串口写入失败"
+    })
 
 
 @app.post("/api/call/hangup")
@@ -900,7 +1120,7 @@ async def get_logs(
     """获取历史日志（从 logs/ 目录的文件读取，支持过滤与分页）"""
     offset = (page - 1) * page_size
     reader = LogFileReader()
-    logs, total = reader.get_logs(
+    logs, total, total_exact = reader.get_logs(
         level=level, keyword=keyword,
         start_time=start_time, end_time=end_time,
         limit=page_size, offset=offset
@@ -910,6 +1130,8 @@ async def get_logs(
         "data": {
             "logs": logs,
             "total": total,
+            # false 表示 total 为下界 (匹配记录过多, 已停止继续扫描), 前端显示为 "≥ N"
+            "total_exact": total_exact,
             "page": page,
             "page_size": page_size,
             "total_pages": (total + page_size - 1) // page_size
@@ -946,6 +1168,11 @@ async def clear_log_cache():
 @app.websocket("/ws/log")
 async def websocket_log(websocket: WebSocket):
     """WebSocket 实时日志推送"""
+    # 准入校验: 同源 + (可选) 会话 Cookie; 不通过则拒绝握手
+    if not ws_authorized(websocket):
+        await websocket.close(code=1008)
+        return
+
     await manager.connect(websocket)
     try:
         while True:
@@ -969,6 +1196,11 @@ async def websocket_webserial_bridge(websocket: WebSocket):
       后端 -> 浏览器: {"type": "registered", "bridge_id": "..."}
     """
     global active_bridges
+
+    # 准入校验: 同源 + (可选) 会话 Cookie; 不通过则拒绝握手
+    if not ws_authorized(websocket):
+        await websocket.close(code=1008)
+        return
 
     await manager.connect(websocket)
     bridge_id = f"ws-{uuid.uuid4().hex[:12]}"

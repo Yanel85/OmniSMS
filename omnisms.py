@@ -44,6 +44,12 @@ class Config:
     OFFLINE_TIMEOUT_SEC: float = HEARTBEAT_INTERVAL_SEC * OFFLINE_MISSED_HEARTBEATS  # 150s
     WATCHDOG_INTERVAL_SEC: float = 10.0         # 掉线看门狗巡检间隔(秒), 应小于心跳间隔以尽早发现
 
+    # 外发短信终态收敛参数。
+    # 固件侧 sms.send() 为异步提交, 只回传 accepted/fail, 不提供运营商投递回执,
+    # 因此 accepted 之后不会再有任何后续事件。若不做收敛, 短信状态会永久停留在 pending。
+    SMS_ACCEPTED_TIMEOUT_SEC: float = 120.0   # accepted 后无后续报告 -> 收敛为 sent(已提交网络)
+    SMS_PENDING_TIMEOUT_SEC: float = 300.0    # 命令下发后完全无响应(掉线/串口异常) -> 收敛为 failed
+
     # 判定端口运行 OmniSMS 协议的事件类型集合。
     # 任一事件出现即确认该口为固件数据口(非 Lua REPL / AT 口),
     # 命中后补发 identify 并延长等待, 争取拿到含 imei 的 boot。
@@ -352,6 +358,13 @@ class SMSTask:
     phone: str
     text: str
     timestamp: str
+    # 任务生命周期追踪(供看门狗做终态收敛, 均为单调时钟秒数):
+    #   created_at  - 命令下发时刻
+    #   accepted_at - 收到固件 accepted 回执的时刻; None 表示尚未收到任何回执
+    #   device_id   - 所属设备标识, 便于收敛时定位与日志排查
+    created_at: float = 0.0
+    accepted_at: Optional[float] = None
+    device_id: str = ""
 
 
 # ==================== OmniSMS 核心引擎 ====================
@@ -1016,8 +1029,22 @@ class OmniSMSEngine:
                 self.port_to_device[paired_port] = new_id
             if old_id in self.active_calls:
                 self.active_calls[new_id] = self.active_calls.pop(old_id)
-        # 旧 devices 行(以 IMEI 兜底)删除, 避免重复; 刚启动阶段历史短信/通话极少
         if self.db:
+            # 先搬迁历史记录: 设备启动初期可能已收发过短信/通话(以 IMEI 兜底的旧标识入库),
+            # 若不迁移, 这些记录会因 device_id 失配而变成查不到的孤儿数据。
+            # 必须在删除旧 devices 行之前执行, 保证迁移与删除的语义顺序。
+            try:
+                moved = self.db.migrate_device_records(old_id, new_id)
+                if moved["sms"] or moved["calls"]:
+                    logger.info(
+                        f"Device history migrated {old_id} -> {new_id}: "
+                        f"{moved['sms']} SMS, {moved['calls']} calls"
+                    )
+            except Exception as e:
+                # 迁移失败不应阻断设备标识升级: 记录错误, 旧记录保持原样可后续补偿
+                logger.error(f"Device history migration failed ({old_id} -> {new_id}): {e}")
+
+            # 旧 devices 行(以 IMEI 兜底)删除, 避免重复
             self.db.delete_device(old_id)
             self.db.upsert_device(
                 device_id=new_id, phone=device.phone, imei=device.imei,
@@ -1072,7 +1099,7 @@ class OmniSMSEngine:
                     f"check every {self.config.WATCHDOG_INTERVAL_SEC:.0f}s)")
 
     def _watchdog_loop(self):
-        """掉线看门狗主循环: 按 WATCHDOG_INTERVAL_SEC 周期巡检设备心跳。"""
+        """看门狗主循环: 按 WATCHDOG_INTERVAL_SEC 周期巡检设备心跳与待确认短信任务。"""
         logger.info("Heartbeat watchdog thread started")
         while self.running and not self.watchdog_stop.is_set():
             if self.watchdog_stop.wait(self.config.WATCHDOG_INTERVAL_SEC):
@@ -1081,7 +1108,43 @@ class OmniSMSEngine:
                 self._check_device_heartbeats()
             except Exception as e:
                 logger.error(f"Error in heartbeat watchdog: {e}")
+            try:
+                self._check_pending_sms_tasks()
+            except Exception as e:
+                logger.error(f"Error in pending SMS task watchdog: {e}")
         logger.info("Heartbeat watchdog thread stopped")
+
+    def _check_pending_sms_tasks(self):
+        """待确认短信任务的终态收敛。
+
+        固件侧 sms.send() 为异步提交且不提供运营商投递回执, 因此:
+          - accepted 之后不会再有任何事件 -> 超时后收敛为 sent (已提交至网络)
+          - 命令下发后完全无响应(设备掉线/串口异常) -> 超时后收敛为 failed
+        这样每条外发短信最终都会落到 sent / failed 之一, 不会永久停留在 pending。
+        """
+        now = time.monotonic()
+        accepted_timeout = self.config.SMS_ACCEPTED_TIMEOUT_SEC
+        pending_timeout = self.config.SMS_PENDING_TIMEOUT_SEC
+
+        # 先在锁内挑出需收敛的任务并出队, 再在锁外落库, 避免持锁做 I/O
+        with self.state_lock:
+            expired = []
+            for task_id, task in list(self.pending_tasks.items()):
+                if task.accepted_at is not None:
+                    if now - task.accepted_at >= accepted_timeout:
+                        expired.append((task_id, "sent", "accepted 后无投递回执"))
+                elif now - task.created_at >= pending_timeout:
+                    expired.append((task_id, "failed", "下发后无响应"))
+            for task_id, _status, _reason in expired:
+                self.pending_tasks.pop(task_id, None)
+
+        for task_id, status, reason in expired:
+            if self.db:
+                try:
+                    self.db.update_sms_status(task_id, status)
+                except Exception as e:
+                    logger.error(f"Failed to finalize SMS task {task_id} as {status}: {e}")
+            logger.info(f"SMS task {task_id} finalized as '{status}' ({reason})")
 
     def _check_device_heartbeats(self):
         """巡检在线设备的最后心跳时间, 超过 OFFLINE_TIMEOUT_SEC 即标记离线。
@@ -1492,9 +1555,30 @@ class OmniSMSEngine:
                 f"net_status={net_status}, rssi={rssi}"
             )
             
-            # accepted 仅表示短信协议栈接受请求，不能标记为最终 sent。
-            if self.db and task_id and status == "fail":
-                self.db.update_sms_status(task_id, "failed")
+            # 状态收敛:
+            #   fail     -> 终态 failed, 立即出队
+            #   accepted -> 中间态 accepted (协议栈已接受并提交至网络), 保留在队列中,
+            #               由看门狗在 SMS_ACCEPTED_TIMEOUT_SEC 后收敛为 sent
+            #   其他/空  -> 按 sent 处理 (固件若日后上报真实投递结果, 会带明确 status)
+            if status == "fail":
+                final_status = "failed"
+            elif status == "accepted":
+                final_status = "accepted"
+            else:
+                final_status = "sent"
+
+            if self.db and task_id:
+                self.db.update_sms_status(task_id, final_status)
+
+            with self.state_lock:
+                task = self.pending_tasks.get(task_id)
+                # accepted 不是终态: 只打时间戳, 留在队列里等看门狗收敛
+                if status == "accepted" and task is not None:
+                    task.accepted_at = time.monotonic()
+                    task.device_id = task.device_id or dev_id
+                else:
+                    self.pending_tasks.pop(task_id, None)
+
             self._notify_event("sms_sent_result", dev_id, {
                 "id": task_id,
                 "status": status,
@@ -1505,10 +1589,6 @@ class OmniSMSEngine:
                 "net_status": net_status,
                 "rssi": rssi,
             })
-            
-            # 从待发队列移除
-            with self.state_lock:
-                self.pending_tasks.pop(task_id, None)
             
         elif event_type == "call_incoming":
             # 来电通知
@@ -1573,13 +1653,15 @@ class OmniSMSEngine:
             logger.error(f"Failed to send SMS command to {device_id}")
             return None
         
-        # 记录待确认任务
+        # 记录待确认任务 (created_at 供看门狗做终态收敛)
         with self.state_lock:
             self.pending_tasks[task_id] = SMSTask(
                 task_id=task_id,
                 phone=phone,
                 text=text,
-                timestamp=utc_timestamp()
+                timestamp=utc_timestamp(),
+                created_at=time.monotonic(),
+                device_id=device_id,
             )
         # 持久化发送记录
         if self.db:
@@ -1589,11 +1671,16 @@ class OmniSMSEngine:
         
         return task_id
     
-    def make_call(self, device_id: str, phone: str) -> bool:
-        """拨打电话"""
+    def make_call(self, device_id: str, phone: str) -> Optional[str]:
+        """拨打电话
+
+        @return: 任务ID (命令下发成功); 发送失败时返回 None
+        """
+        task_id = str(int(time.time()))
+
         command = {
             "action": "dial",
-            "id": str(int(time.time())),
+            "id": task_id,
             "phone": phone
         }
         
@@ -1601,7 +1688,7 @@ class OmniSMSEngine:
         if success and self.db:
             call_id = self.db.add_call(device_id, phone, "out", "dialing")
             self.active_calls[device_id] = (call_id, time.time(), "out")
-        return success
+        return task_id if success else None
     
     def hangup_call(self, device_id: str) -> bool:
         """挂断电话"""
